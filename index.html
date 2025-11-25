@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>ZeroTrace Network Scanner</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="container">
+    <h1>ZeroTrace Network Scanner</h1>
+    <h4>Made by Cole Cardelli</h4>
+    <p>Select scan options and click "Run Scan"</p>
+
+    <div class="controls">
+      <label>Scan Mode:</label>
+      <select id="mode">
+        <option value="quick">Quick</option>
+        <option value="deep">Deep</option>
+        <option value="both">Both</option>
+      </select>
+
+      <label>Discovery Method:</label>
+      <select id="discovery">
+        <option value="nmap">Nmap</option>
+        <option value="arp">ARP</option>
+        <option value="both">Both</option>
+      </select>
+
+      <label>Export Format:</label>
+      <select id="export">
+        <option value="excel">Excel</option>
+        <option value="csv">CSV</option>
+        <option value="json">JSON</option>
+      </select>
+
+      <button onclick="runScan()">Run Scan</button>
+    </div>
+
+    <div id="progressSection" style="display:none; margin-top:20px;">
+      <p><strong>Scanning...</strong></p>
+      <progress id="progressBar" value="0" max="100" style="width:100%;"></progress>
+      <p id="currentDevice">Current Device: —</p>
+    </div>
+
+    <div id="output"></div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
