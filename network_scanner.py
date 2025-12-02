@@ -1,0 +1,3016 @@
+
+'''
+
+# ZeroTrace — Network Scanner with improved discovery (robust nmap subprocess fallback), device naming, latency, subnets, roles, and Excel export
+import scapy.all as scapy
+import socket
+import ipaddress
+import nmap
+import os
+import ctypes
+import platform
+import subprocess
+import time
+from rich.console import Console
+from rich.table import Table
+from rich.progress import Progress
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import requests
+import openpyxl
+import re
+import shutil
+
+console = Console()
+
+# ----------------------
+# Config
+# ----------------------
+CONFIG = {
+    "sniff_seconds": 60,
+    "excel_output": "zerotrace_report.xlsx",
+}
+
+# ----------------------
+# Quick OUI Vendor Map (local fallback)
+# ----------------------
+OUI_VENDOR_MAP = {
+    "B8:27:EB": "Raspberry Pi Foundation",
+    "DC:A6:32": "Amazon Technologies",
+    "AC:63:BE": "Amazon Echo",
+    "3C:5A:B4": "Wyze Labs",
+    "F4:F5:D8": "Google Nest",
+    "D0:73:D5": "Google Smart Hub",
+    "00:1A:11": "Philips Hue",
+    "F0:27:2D": "TP-Link Technologies",
+    "60:01:94": "Xiaomi Communications",
+    "28:6D:97": "Samsung Electronics",
+    "00:16:6C": "Sony Corporation",
+    "F0:18:98": "Apple, Inc."
+}
+
+# ----------------------
+# Utility: Check admin privileges
+# ----------------------
+def is_admin():
+    try:
+        return os.getuid() == 0  # Linux / macOS
+    except AttributeError:
+        try:
+            return ctypes.windll.shell32.IsUserAnAdmin() != 0  # Windows
+        except Exception:
+            return False
+
+# ----------------------
+# Improved MAC Vendor Lookup (local + external API)
+# ----------------------
+def mac_vendor_lookup(mac):
+    if not mac:
+        return "Unknown Vendor"
+    mac_norm = mac.upper().replace(":", "").replace("-", "")
+    oui = mac_norm[:6]
+    prefix = ":".join([oui[i:i+2] for i in range(0, 6, 2)])
+
+    # Local quick lookup
+    vendor = OUI_VENDOR_MAP.get(prefix) or OUI_VENDOR_MAP.get(oui)
+    if vendor:
+        return vendor
+
+    # External lookup via macvendors API (fallback)
+    try:
+        url = f"https://api.macvendors.com/{mac}"
+        r = requests.get(url, timeout=5)
+        if r.status_code == 200 and r.text:
+            return r.text.strip()
+    except Exception:
+        pass
+
+    return "Unknown Vendor"
+
+# ----------------------
+# Hostname / Custom Name detection
+# ----------------------
+def get_reverse_dns(ip):
+    try:
+        name = socket.gethostbyaddr(ip)[0]
+        return name
+    except Exception:
+        return None
+
+def get_nmap_hostnames(info):
+    try:
+        if info and isinstance(info, dict) and "hostnames" in info and info["hostnames"]:
+            for h in info["hostnames"]:
+                name = h.get("name")
+                if name:
+                    return name
+    except Exception:
+        pass
+    return None
+
+def get_netbios_name(ip):
+    if platform.system().lower() != "windows":
+        return None
+    try:
+        out = subprocess.check_output(["nbtstat", "-A", ip], universal_newlines=True, stderr=subprocess.DEVNULL)
+        m = re.search(r"^\s*([^\s<]+)\s+<00>\s+UNIQUE", out, re.I | re.M)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    return None
+
+def get_custom_name(ip, info):
+    rdns = get_reverse_dns(ip)
+    if rdns and rdns != ip:
+        return rdns
+    nmname = get_nmap_hostnames(info)
+    if nmname:
+        return nmname
+    nb = get_netbios_name(ip)
+    if nb:
+        return nb
+    return "Unknown"
+
+# ----------------------
+# Ping Latency
+# ----------------------
+def ping_latency_ms(ip, attempts=2, timeout_ms=1000):
+    try:
+        system = platform.system().lower()
+        if system == "windows":
+            cmd = ["ping", "-n", str(attempts), "-w", str(timeout_ms), ip]
+        else:
+            t = max(1, int(timeout_ms / 1000))
+            cmd = ["ping", "-c", str(attempts), "-W", str(t), ip]
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, universal_newlines=True, timeout=(attempts * (timeout_ms/1000) + 5))
+        out = proc.stdout
+        if not out:
+            return None
+        if system == "windows":
+            m = re.search(r"Average = (\d+)ms", out)
+            if m:
+                return float(m.group(1))
+        else:
+            m = re.search(r"rtt [\w/]+ = [\d\.]+/([\d\.]+)/", out)
+            if m:
+                return float(m.group(1))
+    except Exception:
+        return None
+    return None
+
+# ----------------------
+# Wi-Fi SSID (local host)
+# ----------------------
+def get_wifi_ssid():
+    try:
+        system = platform.system().lower()
+        if system == "windows":
+            out = subprocess.check_output("netsh wlan show interfaces", shell=True, stderr=subprocess.DEVNULL, universal_newlines=True)
+            m = re.search(r"SSID\s*:\s(.+)", out)
+            if m:
+                return m.group(1).strip()
+        else:
+            try:
+                out = subprocess.check_output("iwgetid -r", shell=True, stderr=subprocess.DEVNULL, universal_newlines=True).strip()
+                return out if out else "Unknown"
+            except Exception:
+                return "Unknown"
+    except Exception:
+        return "Unknown"
+
+# ----------------------
+# Discovery helpers: ARP and robust Nmap (with subprocess fallback)
+# ----------------------
+def arp_discover(network_cidr):
+    console.print(f"[cyan]Running ARP discovery on {network_cidr}...[/cyan]")
+    arp_request = scapy.ARP(pdst=network_cidr)
+    broadcast = scapy.Ether(dst="ff:ff:ff:ff:ff:ff")
+    arp_request_broadcast = broadcast/arp_request
+    answered = scapy.srp(arp_request_broadcast, timeout=2, verbose=False)[0]
+    devices = []
+    for _, received in answered:
+        devices.append({"ip": received.psrc, "mac": (received.hwsrc or "").upper(), "info": None})
+    console.print(f"[green]ARP discovered {len(devices)} devices[/green]")
+    return devices
+
+def nmap_discover(network_cidr):
+    """
+    Robust Nmap discovery:
+      1) Try python-nmap PortScanner.scan(...)
+      2) If that raises, run 'nmap -sn <network>' via subprocess and parse text output
+      3) If nmap is not installed, fall back to ARP discovery
+    Returns list of dicts: {"ip": ip, "mac": mac, "info": None}
+    """
+    nm = nmap.PortScanner()
+    devices = []
+
+    # Ensure nmap binary exists
+    if not shutil.which("nmap"):
+        console.print("[yellow]nmap binary not found in PATH — falling back to ARP discovery[/yellow]")
+        return arp_discover(network_cidr)
+
+    # 1) Try python-nmap (best if works)
+    try:
+        console.print(f"[cyan]Trying python-nmap discovery on {network_cidr}...[/cyan]")
+        nm.scan(hosts=network_cidr, arguments="-sn")
+        for host in nm.all_hosts():
+            try:
+                mac = nm[host]['addresses'].get('mac', '').upper()
+            except Exception:
+                mac = ""
+            devices.append({"ip": host, "mac": mac, "info": nm[host] if host in nm.all_hosts() else None})
+        console.print(f"[green]python-nmap discovered {len(devices)} hosts[/green]")
+        return devices
+    except Exception as e:
+        try:
+            snippet = e.args[0]
+            if isinstance(snippet, (bytes, bytearray)):
+                snippet = snippet.decode(errors="ignore")[:300]
+            else:
+                snippet = str(snippet)[:300]
+        except Exception:
+            snippet = str(e)[:300]
+        console.print(f"[yellow]python-nmap discovery failed: {snippet} — trying subprocess nmap output parse[/yellow]")
+
+    # 2) Run nmap via subprocess and parse text output
+    try:
+        console.print(f"[cyan]Running 'nmap -sn {network_cidr}' via subprocess (fallback)...[/cyan]")
+        proc = subprocess.run(["nmap", "-sn", network_cidr], capture_output=True, text=True, timeout=300)
+        out = proc.stdout or ""
+        current_ip = None
+        devices = []
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith("Nmap scan report for "):
+                parts = line.split()
+                ip = parts[-1]
+                current_ip = ip
+                devices.append({"ip": ip, "mac": "", "info": None})
+            elif "MAC Address:" in line and current_ip:
+                m = line.split("MAC Address:")[-1].strip()
+                mac_addr = m.split()[0].strip().upper()
+                for d in devices[::-1]:
+                    if d["ip"] == current_ip and (d["mac"] == "" or d["mac"] is None):
+                        d["mac"] = mac_addr
+                        break
+        console.print(f"[green]Subprocess nmap discovered {len(devices)} hosts[/green]")
+        if devices:
+            return devices
+    except subprocess.TimeoutExpired:
+        console.print("[red]Subprocess nmap timed out[/red]")
+    except Exception as e:
+        console.print(f"[yellow]Subprocess nmap parse failed: {e}[/yellow]")
+
+    # 3) Final fallback - ARP discovery
+    console.print("[yellow]Falling back to ARP discovery[/yellow]")
+    return arp_discover(network_cidr)
+
+# ----------------------
+# Device scan (per-host Nmap)
+# ----------------------
+def scan_device(ip, mode="quick"):
+    nm = nmap.PortScanner()
+    try:
+        if mode == "quick":
+            args = "-sS -T4 --top-ports 20"
+        else:
+            args = "-sS -sV -O --top-ports 100 --osscan-guess --script vuln --max-retries 2"
+        nm.scan(ip, arguments=args, timeout=45)
+        return nm[ip] if ip in nm.all_hosts() else {}
+    except Exception as e:
+        console.print(f"[yellow][!] Scan error for {ip}: {e}[/yellow]")
+        return {}
+
+# ----------------------
+# Helper to get devices list based on chosen discovery method
+# ----------------------
+def get_discovered_devices(network_cidr, method="nmap"):
+    if method == "nmap":
+        return nmap_discover(network_cidr)
+    else:
+        return arp_discover(network_cidr)
+
+# ----------------------
+# Role detection heuristics
+# ----------------------
+def detect_role(info, ip):
+    if not info:
+        return "Generic Device"
+    try:
+        if isinstance(info, dict) and "osmatch" in info and info["osmatch"]:
+            for o in info["osmatch"]:
+                name = o.get("name", "").lower()
+                if "router" in name or "cisco" in name:
+                    return "Router"
+                if "firewall" in name:
+                    return "Firewall"
+        if isinstance(info, dict) and "osclass" in info and info["osclass"]:
+            for cls in info["osclass"]:
+                t = (cls.get("type") or "").lower()
+                if "firewall" in t:
+                    return "Firewall"
+        try:
+            protocols = info.all_protocols()
+        except Exception:
+            protocols = []
+        for proto in protocols:
+            ports = info.get(proto, {})
+            if 53 in ports:
+                return "DNS Server"
+            if 67 in ports or 68 in ports:
+                return "DHCP Server"
+            if 9100 in ports:
+                return "Printer"
+            if 554 in ports:
+                return "Camera"
+            if 22 in ports and (80 not in ports and 443 not in ports):
+                return "SSH Host"
+            if 80 in ports or 443 in ports:
+                try:
+                    if ip.endswith(".1"):
+                        return "Gateway / Router"
+                except Exception:
+                    pass
+                return "Web Server"
+    except Exception:
+        pass
+    return "Generic Device"
+
+# ----------------------
+# Phase 1: Scan network (discovery + per-host scanning)
+# ----------------------
+def get_local_ip():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+    except Exception:
+        ip = None
+    finally:
+        s.close()
+    return ip
+
+def scan_network(mode="quick", discovery_method="nmap"):
+    local_ip = get_local_ip()
+    if not local_ip:
+        console.print("[red]Could not detect local IP. Exiting.[/red]")
+        return []
+
+    network_cidr = str(ipaddress.ip_network(f"{local_ip}/24", strict=False))
+    console.print(f"[blue]Using discovery range: {network_cidr}[/blue]")
+
+    # discovery (Nmap or ARP)
+    discovered = get_discovered_devices(network_cidr, method=discovery_method)
+
+    console.print(f"[cyan]Beginning detailed scans for {len(discovered)} discovered devices...[/cyan]")
+    results = []
+    with Progress() as progress:
+        task = progress.add_task("[green]Scanning devices...", total=len(discovered))
+        with ThreadPoolExecutor(max_workers=30) as executor:
+            future_to_dev = {executor.submit(scan_device, d["ip"], mode): d for d in discovered}
+            for future in as_completed(future_to_dev):
+                dev = future_to_dev[future]
+                try:
+                    info = future.result(timeout=60)
+                except Exception as e:
+                    console.print(f"[red][!] Error scanning {dev['ip']}: {e}[/red]")
+                    info = {}
+                results.append({"ip": dev["ip"], "mac": dev.get("mac", ""), "info": info})
+                progress.update(task, advance=1)
+    return results
+
+# ----------------------
+# Phase 2: Traffic Capture
+# ----------------------
+def capture_traffic(duration=60):
+    console.print(f"[cyan]Sniffing network traffic for {duration} seconds...[/cyan]")
+    try:
+        packets = scapy.sniff(timeout=duration)
+    except Exception as e:
+        console.print(f"[yellow]Sniff failed ({e}); continuing without traffic capture[/yellow]")
+        packets = []
+    communications = defaultdict(set)
+    for pkt in packets:
+        if pkt.haslayer(scapy.IP):
+            try:
+                src = pkt[scapy.IP].src
+                dst = pkt[scapy.IP].dst
+                communications[src].add(dst)
+                communications[dst].add(src)
+            except Exception:
+                continue
+    return communications
+
+# ----------------------
+# Risk Analysis
+# ----------------------
+def analyze_risks(info):
+    if not info:
+        return ["Unreachable"]
+    risks = []
+    risky_ports = {
+        21: "FTP (insecure)",
+        23: "Telnet (plaintext)",
+        25: "SMTP exposed",
+        53: "DNS tunneling risk",
+        111: "RPC exploit",
+        135: "MS RPC risk",
+        139: "NetBIOS exploit",
+        445: "SMB vulnerability",
+        3389: "RDP exposed",
+        5900: "VNC exposed"
+    }
+    try:
+        protocols = info.all_protocols() if info else []
+    except Exception:
+        protocols = []
+    for proto in protocols:
+        ports = info.get(proto, {}) if isinstance(info, dict) else info.get(proto, {})
+        for port, svc in ports.items():
+            try:
+                state = svc.get("state", "") if isinstance(svc, dict) else ""
+            except Exception:
+                state = ""
+            if state == "open":
+                if port in risky_ports:
+                    risks.append(f"Critical: {risky_ports[port]}")
+                elif port in (80, 8080, 8443):
+                    risks.append("Medium: Web interface exposed")
+                elif port == 22:
+                    risks.append("Medium: SSH exposed")
+                elif port in (1900, 5353):
+                    risks.append("IoT protocol exposed")
+    if not risks:
+        risks.append("No major risks detected")
+    return risks
+
+# ----------------------
+# Subnet detection
+# ----------------------
+def detect_subnets(devices):
+    subnets = set()
+    for d in devices:
+        try:
+            ip = ipaddress.ip_address(d["ip"])
+            if ip.is_private:
+                net = ipaddress.ip_network(f"{ip}/24", strict=False)
+                subnets.add(str(net))
+        except Exception:
+            pass
+    return subnets
+
+# ----------------------
+# Report generation & Excel export
+# ----------------------
+def generate_report(devices, communications):
+    table = Table(title="ZeroTrace Network Report")
+    table.add_column("IP", style="cyan")
+    table.add_column("MAC", style="magenta")
+    table.add_column("Vendor", style="green")
+    table.add_column("Custom Name", style="yellow")
+    table.add_column("Role", style="blue")
+    table.add_column("OS", style="cyan")
+    table.add_column("Latency (ms)", style="magenta")
+    table.add_column("Risks", style="red")
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Scan Report"
+    ws.append(["IP", "MAC", "Vendor", "Custom Name", "Role", "OS", "Latency (ms)", "Open Ports", "Risks", "Communications"])
+
+    for dev in devices:
+        ip = dev.get("ip", "Unknown")
+        mac = (dev.get("mac") or "").upper()
+        info = dev.get("info") or {}
+
+        vendor = mac_vendor_lookup(mac)
+        custom_name = get_custom_name(ip, info)
+        role = detect_role(info, ip)
+        os_name = "Unknown"
+        try:
+            if isinstance(info, dict) and "osmatch" in info and info["osmatch"]:
+                os_name = info["osmatch"][0].get("name", "Unknown")
+            elif isinstance(info, dict) and "osclass" in info and info["osclass"]:
+                os_name = info["osclass"][0].get("osfamily", "Unknown")
+        except Exception:
+            os_name = "Unknown"
+
+        latency = ping_latency_ms(ip)
+        latency_str = f"{latency:.1f}" if latency else "N/A"
+
+        risks = analyze_risks(info)
+        risks_str = "; ".join(risks)
+
+        # Open ports summary
+        ports = []
+        try:
+            protocols = info.all_protocols() if info else []
+        except Exception:
+            protocols = []
+        for proto in protocols:
+            proto_ports = info.get(proto, {}) if isinstance(info, dict) else info.get(proto, {})
+            for p, svc in proto_ports.items():
+                svc_name = svc.get("name", "?") if isinstance(svc, dict) else "?"
+                ports.append(f"{p}/{proto} ({svc_name})")
+
+        # Communications summary
+        comms = []
+        if ip in communications:
+            for peer in communications[ip]:
+                try:
+                    if peer == ip:
+                        continue
+                    comms.append(f"{peer} [Internal]" if ipaddress.ip_address(peer).is_private else f"{peer} [External]")
+                except Exception:
+                    continue
+        comms_str = ", ".join(comms) if comms else "No traffic observed"
+
+        # Console
+        table.add_row(str(ip), str(mac), str(vendor), str(custom_name), str(role), str(os_name), str(latency_str), risks_str)
+
+        # Excel
+        ws.append([
+            str(ip),
+            str(mac),
+            str(vendor),
+            str(custom_name),
+            str(role),
+            str(os_name),
+            str(latency_str),
+            str(", ".join(ports) if ports else "None"),
+            str(risks_str),
+            str(comms_str)
+        ])
+
+    console.print(table)
+    wb.save(CONFIG["excel_output"])
+    console.print(f"[green]✔ Report saved to {os.path.abspath(CONFIG['excel_output'])}[/green]")
+
+# ----------------------
+# Main
+# ----------------------
+def main():
+    admin = is_admin()
+    if admin:
+        console.print("[green]✔ Running with administrator privileges[/green]")
+    else:
+        console.print("[red]✖ Not running as administrator (some features may fail)[/red]")
+
+    # Scan mode
+    mode = console.input("[cyan]Choose scan mode ([b]quick[/b]/[b]deep[/b]): ").strip().lower()
+    if mode not in ["quick", "deep"]:
+        mode = "quick"
+
+    # Discovery method: Nmap (default) or ARP (fast)
+    disc = console.input("[cyan]Discovery method ([b]nmap[/b]/[b]arp[/b]) [nmap]: ").strip().lower() or "nmap"
+    if disc not in ["nmap", "arp"]:
+        disc = "nmap"
+
+    ssid = get_wifi_ssid()
+    console.print(f"[blue]Connected Wi-Fi SSID: {ssid}[/blue]")
+
+    devices = scan_network(mode=mode, discovery_method=disc)
+    communications = capture_traffic(duration=CONFIG.get("sniff_seconds", 60))
+
+    # detect subnets
+    subnets = detect_subnets(devices)
+    if subnets:
+        console.print(f"[cyan]Detected private subnets: {', '.join(sorted(subnets))}[/cyan]")
+
+    console.print("[green]\\n✔ Scan complete. Generating report...[/green]")
+    generate_report(devices, communications)
+
+if __name__ == "__main__":
+    main()
+
+'''
+
+
+
+
+
+
+
+
+'''
+#  USES TWO OPTIONS: DEEP & QUICK MODE SCANS
+
+# ZeroTrace — robust report generation (parallelized, per-device timeouts)
+import scapy.all as scapy
+import socket
+import ipaddress
+import nmap
+import os
+import ctypes
+import platform
+import subprocess
+import time
+from rich.console import Console
+from rich.table import Table
+from rich.progress import Progress
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED, TimeoutError
+import requests
+import openpyxl
+import re
+import shutil
+
+console = Console()
+
+# ----------------------
+# Config
+# ----------------------
+CONFIG = {
+    "sniff_seconds": 60,
+    "excel_output": "zerotrace_report.xlsx",
+    "device_processing_timeout": 10,   # seconds allowed per device when generating report
+    "device_thread_workers": 20,       # parallelism for report generation
+    "scan_thread_workers": 30,         # parallelism for scanning
+}
+
+# ----------------------
+# Quick OUI Vendor Map (local fallback)
+# ----------------------
+OUI_VENDOR_MAP = {
+    "B8:27:EB": "Raspberry Pi Foundation",
+    "DC:A6:32": "Amazon Technologies",
+    "AC:63:BE": "Amazon Echo",
+    "3C:5A:B4": "Wyze Labs",
+    "F4:F5:D8": "Google Nest",
+    "D0:73:D5": "Google Smart Hub",
+    "00:1A:11": "Philips Hue",
+    "F0:27:2D": "TP-Link Technologies",
+    "60:01:94": "Xiaomi Communications",
+    "28:6D:97": "Samsung Electronics",
+    "00:16:6C": "Sony Corporation",
+    "F0:18:98": "Apple, Inc."
+}
+
+# ----------------------
+# Utility: Check admin privileges
+# ----------------------
+def is_admin():
+    try:
+        return os.getuid() == 0  # Linux / macOS
+    except AttributeError:
+        try:
+            return ctypes.windll.shell32.IsUserAnAdmin() != 0  # Windows
+        except Exception:
+            return False
+
+# ----------------------
+# Improved MAC Vendor Lookup
+# ----------------------
+def mac_vendor_lookup(mac):
+    if not mac:
+        return "Unknown Vendor"
+    mac_norm = mac.upper().replace(":", "").replace("-", "")
+    oui = mac_norm[:6]
+    prefix = ":".join([oui[i:i+2] for i in range(0, 6, 2)])
+    vendor = OUI_VENDOR_MAP.get(prefix) or OUI_VENDOR_MAP.get(oui)
+    if vendor:
+        return vendor
+    try:
+        url = f"https://api.macvendors.com/{mac}"
+        r = requests.get(url, timeout=4)
+        if r.status_code == 200 and r.text:
+            return r.text.strip()
+    except Exception:
+        pass
+    return "Unknown Vendor"
+
+# ----------------------
+# Hostname / Custom Name detection
+# (made safe — these are called inside threads so blocking is limited by timeout)
+# ----------------------
+def get_reverse_dns(ip):
+    try:
+        name = socket.gethostbyaddr(ip)[0]
+        return name
+    except Exception:
+        return None
+
+def get_nmap_hostnames(info):
+    try:
+        if info and isinstance(info, dict) and "hostnames" in info and info["hostnames"]:
+            for h in info["hostnames"]:
+                name = h.get("name")
+                if name:
+                    return name
+    except Exception:
+        pass
+    return None
+
+def get_netbios_name(ip):
+    # Windows only; may block so we keep it in thread with timeout
+    if platform.system().lower() != "windows":
+        return None
+    try:
+        out = subprocess.check_output(["nbtstat", "-A", ip], universal_newlines=True, stderr=subprocess.DEVNULL, timeout=5)
+        m = re.search(r"^\s*([^\s<]+)\s+<00>\s+UNIQUE", out, re.I | re.M)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    return None
+
+def get_custom_name(ip, info):
+    # Called inside a worker thread; blocking DNS/nbtstat limited by thread timeout
+    rdns = get_reverse_dns(ip)
+    if rdns and rdns != ip:
+        return rdns
+    nmname = get_nmap_hostnames(info)
+    if nmname:
+        return nmname
+    nb = get_netbios_name(ip)
+    if nb:
+        return nb
+    return "Unknown"
+
+# ----------------------
+# Ping Latency (runs in thread; limited by worker timeout)
+# ----------------------
+def ping_latency_ms(ip, attempts=2, timeout_ms=800):
+    try:
+        system = platform.system().lower()
+        if system == "windows":
+            cmd = ["ping", "-n", str(attempts), "-w", str(timeout_ms), ip]
+        else:
+            t = max(1, int(timeout_ms / 1000))
+            cmd = ["ping", "-c", str(attempts), "-W", str(t), ip]
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, universal_newlines=True, timeout=(attempts * (timeout_ms/1000) + 3))
+        out = proc.stdout
+        if not out:
+            return None
+        if system == "windows":
+            m = re.search(r"Average = (\d+)ms", out)
+            if m:
+                return float(m.group(1))
+        else:
+            m = re.search(r"rtt [\w/]+ = [\d\.]+/([\d\.]+)/", out)
+            if m:
+                return float(m.group(1))
+    except Exception:
+        return None
+    return None
+
+# ----------------------
+# Wi-Fi SSID (local host)
+# ----------------------
+def get_wifi_ssid():
+    try:
+        system = platform.system().lower()
+        if system == "windows":
+            out = subprocess.check_output("netsh wlan show interfaces", shell=True, stderr=subprocess.DEVNULL, universal_newlines=True, timeout=3)
+            m = re.search(r"SSID\s*:\s(.+)", out)
+            if m:
+                return m.group(1).strip()
+        else:
+            try:
+                out = subprocess.check_output("iwgetid -r", shell=True, stderr=subprocess.DEVNULL, universal_newlines=True, timeout=3).strip()
+                return out if out else "Unknown"
+            except Exception:
+                return "Unknown"
+    except Exception:
+        return "Unknown"
+
+# ----------------------
+# Discovery helpers
+# ----------------------
+def arp_discover(network_cidr):
+    console.print(f"[cyan]Running ARP discovery on {network_cidr}...[/cyan]")
+    arp_request = scapy.ARP(pdst=network_cidr)
+    broadcast = scapy.Ether(dst="ff:ff:ff:ff:ff:ff")
+    arp_request_broadcast = broadcast/arp_request
+    answered = scapy.srp(arp_request_broadcast, timeout=2, verbose=False)[0]
+    devices = []
+    for _, received in answered:
+        devices.append({"ip": received.psrc, "mac": (received.hwsrc or "").upper(), "info": None})
+    console.print(f"[green]ARP discovered {len(devices)} devices[/green]")
+    return devices
+
+def nmap_discover(network_cidr):
+    nm = nmap.PortScanner()
+    devices = []
+    if not shutil.which("nmap"):
+        console.print("[yellow]nmap binary not found in PATH — falling back to ARP discovery[/yellow]")
+        return arp_discover(network_cidr)
+    try:
+        console.print(f"[cyan]Trying python-nmap discovery on {network_cidr}...[/cyan]")
+        nm.scan(hosts=network_cidr, arguments="-sn")
+        for host in nm.all_hosts():
+            try:
+                mac = nm[host]['addresses'].get('mac', '').upper()
+            except Exception:
+                mac = ""
+            devices.append({"ip": host, "mac": mac, "info": nm[host] if host in nm.all_hosts() else None})
+        console.print(f"[green]python-nmap discovered {len(devices)} hosts[/green]")
+        return devices
+    except Exception as e:
+        console.print(f"[yellow]python-nmap discovery failed: {e} — falling back to ARP[/yellow]")
+        return arp_discover(network_cidr)
+
+# ----------------------
+# Device scan (per-host Nmap)
+# ----------------------
+def scan_device(ip, mode="quick"):
+    nm = nmap.PortScanner()
+    try:
+        if mode == "quick":
+            args = "-sS -T4 --top-ports 20"
+        else:
+            args = "-sS -sV -O --top-ports 100 --osscan-guess --script vuln --max-retries 2"
+        nm.scan(ip, arguments=args, timeout=45)
+        return nm[ip] if ip in nm.all_hosts() else {}
+    except Exception as e:
+        console.print(f"[yellow][!] Scan error for {ip}: {e}[/yellow]")
+        return {}
+
+def get_discovered_devices(network_cidr, method="nmap"):
+    if method == "nmap":
+        return nmap_discover(network_cidr)
+    else:
+        return arp_discover(network_cidr)
+
+# ----------------------
+# Role detection heuristics
+# ----------------------
+def detect_role(info, ip):
+    if not info:
+        return "Generic Device"
+    try:
+        if isinstance(info, dict) and "osmatch" in info and info["osmatch"]:
+            for o in info["osmatch"]:
+                name = o.get("name", "").lower()
+                if "router" in name or "cisco" in name:
+                    return "Router"
+                if "firewall" in name:
+                    return "Firewall"
+        if isinstance(info, dict) and "osclass" in info and info["osclass"]:
+            for cls in info["osclass"]:
+                t = (cls.get("type") or "").lower()
+                if "firewall" in t:
+                    return "Firewall"
+        try:
+            protocols = info.all_protocols()
+        except Exception:
+            protocols = []
+        for proto in protocols:
+            ports = info.get(proto, {})
+            if 53 in ports:
+                return "DNS Server"
+            if 67 in ports or 68 in ports:
+                return "DHCP Server"
+            if 9100 in ports:
+                return "Printer"
+            if 554 in ports:
+                return "Camera"
+            if 22 in ports and (80 not in ports and 443 not in ports):
+                return "SSH Host"
+            if 80 in ports or 443 in ports:
+                if ip.endswith(".1"):
+                    return "Gateway / Router"
+                return "Web Server"
+    except Exception:
+        pass
+    return "Generic Device"
+
+# ----------------------
+# Scan network (discovery + per-host scanning)
+# ----------------------
+def get_local_ip():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+    except Exception:
+        ip = None
+    finally:
+        s.close()
+    return ip
+
+def scan_network(mode="quick", discovery_method="nmap"):
+    local_ip = get_local_ip()
+    if not local_ip:
+        console.print("[red]Could not detect local IP. Exiting.[/red]")
+        return []
+    network_cidr = str(ipaddress.ip_network(f"{local_ip}/24", strict=False))
+    console.print(f"[blue]Using discovery range: {network_cidr}[/blue]")
+    discovered = get_discovered_devices(network_cidr, method=discovery_method)
+    console.print(f"[cyan]Beginning detailed scans for {len(discovered)} discovered devices...[/cyan]")
+    results = []
+    with Progress() as progress:
+        task = progress.add_task("[green]Scanning devices...", total=len(discovered))
+        with ThreadPoolExecutor(max_workers=CONFIG["scan_thread_workers"]) as executor:
+            future_to_dev = {executor.submit(scan_device, d["ip"], mode): d for d in discovered}
+            for future in as_completed(future_to_dev):
+                dev = future_to_dev[future]
+                try:
+                    info = future.result(timeout=60)
+                except Exception as e:
+                    console.print(f"[red][!] Error scanning {dev['ip']}: {e}[/red]")
+                    info = {}
+                results.append({"ip": dev["ip"], "mac": dev.get("mac", ""), "info": info})
+                progress.update(task, advance=1)
+    return results
+
+# ----------------------
+# Phase 2: Traffic Capture
+# ----------------------
+def capture_traffic(duration=60):
+    console.print(f"[cyan]Sniffing network traffic for {duration} seconds...[/cyan]")
+    try:
+        packets = scapy.sniff(timeout=duration)
+    except Exception as e:
+        console.print(f"[yellow]Sniff failed ({e}); continuing without traffic capture[/yellow]")
+        packets = []
+    communications = defaultdict(set)
+    for pkt in packets:
+        if pkt.haslayer(scapy.IP):
+            try:
+                src = pkt[scapy.IP].src
+                dst = pkt[scapy.IP].dst
+                communications[src].add(dst)
+                communications[dst].add(src)
+            except Exception:
+                continue
+    return communications
+
+# ----------------------
+# Risk Analysis
+# ----------------------
+def analyze_risks(info):
+    if not info:
+        return ["Unreachable"]
+    risks = []
+    risky_ports = {
+        21: "FTP (insecure)",
+        23: "Telnet (plaintext)",
+        25: "SMTP exposed",
+        53: "DNS tunneling risk",
+        111: "RPC exploit",
+        135: "MS RPC risk",
+        139: "NetBIOS exploit",
+        445: "SMB vulnerability",
+        3389: "RDP exposed",
+        5900: "VNC exposed"
+    }
+    try:
+        protocols = info.all_protocols() if info else []
+    except Exception:
+        protocols = []
+    for proto in protocols:
+        ports = info.get(proto, {}) if isinstance(info, dict) else info.get(proto, {})
+        for port, svc in ports.items():
+            try:
+                state = svc.get("state", "") if isinstance(svc, dict) else ""
+            except Exception:
+                state = ""
+            if state == "open":
+                if port in risky_ports:
+                    risks.append(f"Critical: {risky_ports[port]}")
+                elif port in (80, 8080, 8443):
+                    risks.append("Medium: Web interface exposed")
+                elif port == 22:
+                    risks.append("Medium: SSH exposed")
+                elif port in (1900, 5353):
+                    risks.append("IoT protocol exposed")
+    if not risks:
+        risks.append("No major risks detected")
+    return risks
+
+# ----------------------
+# Subnet detection
+# ----------------------
+def detect_subnets(devices):
+    subnets = set()
+    for d in devices:
+        try:
+            ip = ipaddress.ip_address(d["ip"])
+            if ip.is_private:
+                net = ipaddress.ip_network(f"{ip}/24", strict=False)
+                subnets.add(str(net))
+        except Exception:
+            pass
+    return subnets
+
+# ----------------------
+# Per-device processing worker (safe, limited work)
+# ----------------------
+def process_device(dev, communications):
+    """Process a single device and return a dict of the prepared fields.
+       This runs inside a thread and should not block longer than timeout set when retrieving the future result.
+    """
+    ip = str(dev.get("ip", "Unknown"))
+    mac = (dev.get("mac") or "").upper()
+    info = dev.get("info") or {}
+
+    # vendor (quick)
+    vendor = mac_vendor_lookup(mac)
+
+    # custom name (may call DNS/nbtstat; done inside thread)
+    custom_name = get_custom_name(ip, info)
+
+    # role / OS
+    role = detect_role(info, ip)
+    os_name = "Unknown"
+    try:
+        if isinstance(info, dict) and "osmatch" in info and info["osmatch"]:
+            os_name = info["osmatch"][0].get("name", "Unknown")
+        elif isinstance(info, dict) and "osclass" in info and info["osclass"]:
+            os_name = info["osclass"][0].get("osfamily", "Unknown")
+    except Exception:
+        os_name = "Unknown"
+
+    # latency (runs ping in thread)
+    latency = ping_latency_ms(ip)
+    latency_str = f"{latency:.1f}" if latency else "N/A"
+
+    # risks
+    risks = analyze_risks(info)
+    risks_str = "; ".join(risks)
+
+    # ports summary (safe parsing)
+    ports = []
+    try:
+        if hasattr(info, "all_protocols"):
+            protocols = info.all_protocols()
+        elif isinstance(info, dict):
+            protocols = list(info.keys())
+        else:
+            protocols = []
+        for proto in protocols:
+            proto_ports = info.get(proto, {}) if isinstance(info, dict) else {}
+            for p, svc in proto_ports.items():
+                svc_name = svc.get("name", "?") if isinstance(svc, dict) else "?"
+                ports.append(f"{p}/{proto} ({svc_name})")
+    except Exception:
+        ports = []
+
+    # communications summary
+    comms = []
+    try:
+        if ip in communications:
+            for peer in communications[ip]:
+                try:
+                    if peer == ip:
+                        continue
+                    label = "Internal" if ipaddress.ip_address(peer).is_private else "External"
+                    comms.append(f"{peer} [{label}]")
+                except Exception:
+                    continue
+    except Exception:
+        comms = []
+
+    return {
+        "ip": ip,
+        "mac": mac,
+        "vendor": vendor,
+        "custom_name": custom_name,
+        "role": role,
+        "os_name": os_name,
+        "latency_str": latency_str,
+        "ports": ports,
+        "risks_str": risks_str,
+        "comms_str": ", ".join(comms) if comms else "No traffic observed"
+    }
+
+# ----------------------
+# Report generation & Excel export (parallel, time-limited per device)
+# ----------------------
+def generate_report(devices, communications):
+    # Prepare table and Excel
+    table = Table(title="ZeroTrace Network Report")
+    table.add_column("IP", style="cyan")
+    table.add_column("MAC", style="magenta")
+    table.add_column("Vendor", style="green")
+    table.add_column("Custom Name", style="yellow")
+    table.add_column("Role", style="blue")
+    table.add_column("OS", style="cyan")
+    table.add_column("Latency (ms)", style="magenta")
+    table.add_column("Risks", style="red")
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Scan Report"
+    ws.append(["IP", "MAC", "Vendor", "Custom Name", "Role", "OS", "Latency (ms)", "Open Ports", "Risks", "Communications"])
+
+    total = len(devices)
+    console.print(f"[cyan]Generating report for {total} devices (processing up to {CONFIG['device_processing_timeout']}s each)...[/cyan]")
+
+    with ThreadPoolExecutor(max_workers=CONFIG["device_thread_workers"]) as executor:
+        futures = {executor.submit(process_device, dev, communications): dev for dev in devices}
+        processed = 0
+        for future in as_completed(futures):
+            dev = futures[future]
+            processed += 1
+            try:
+                # Wait up to device_processing_timeout for each future result
+                result = future.result(timeout=CONFIG["device_processing_timeout"])
+            except TimeoutError:
+                console.print(f"[red][!] Device processing timed out for {dev.get('ip')}[/red]")
+                # fallback minimal data
+                result = {
+                    "ip": str(dev.get("ip", "Unknown")),
+                    "mac": str(dev.get("mac", "")).upper(),
+                    "vendor": "Unknown (timeout)",
+                    "custom_name": "Unknown",
+                    "role": "Unknown",
+                    "os_name": "Unknown",
+                    "latency_str": "N/A",
+                    "ports": [],
+                    "risks_str": "Processing timed out",
+                    "comms_str": "Unknown"
+                }
+            except Exception as e:
+                console.print(f"[red][!] Device processing error for {dev.get('ip')}: {e}[/red]")
+                result = {
+                    "ip": str(dev.get("ip", "Unknown")),
+                    "mac": str(dev.get("mac", "")).upper(),
+                    "vendor": "Unknown (error)",
+                    "custom_name": "Unknown",
+                    "role": "Unknown",
+                    "os_name": "Unknown",
+                    "latency_str": "N/A",
+                    "ports": [],
+                    "risks_str": "Error during processing",
+                    "comms_str": "Unknown"
+                }
+
+            # Add to table & excel (force strings)
+            table.add_row(
+                str(result["ip"]),
+                str(result["mac"]),
+                str(result["vendor"]),
+                str(result["custom_name"]),
+                str(result["role"]),
+                str(result["os_name"]),
+                str(result["latency_str"]),
+                str(result["risks_str"])
+            )
+            ws.append([
+                str(result["ip"]),
+                str(result["mac"]),
+                str(result["vendor"]),
+                str(result["custom_name"]),
+                str(result["role"]),
+                str(result["os_name"]),
+                str(result["latency_str"]),
+                str(", ".join(result["ports"]) if result["ports"] else "None"),
+                str(result["risks_str"]),
+                str(result["comms_str"])
+            ])
+
+            console.print(f"[blue]✔ Processed {processed}/{total}: {result['ip']}[/blue]")
+
+    console.print(table)
+    try:
+        wb.save(CONFIG["excel_output"])
+        console.print(f"[green]✔ Report saved to {os.path.abspath(CONFIG['excel_output'])}[/green]")
+    except Exception as e:
+        console.print(f"[red]Failed to save Excel file: {e}[/red]")
+
+# ----------------------
+# Main
+# ----------------------
+def main():
+    admin = is_admin()
+    if admin:
+        console.print("[green]✔ Running with administrator privileges[/green]")
+    else:
+        console.print("[red]✖ Not running as administrator (some features may fail)[/red]")
+
+    mode = console.input("[cyan]Choose scan mode ([b]quick[/b]/[b]deep[/b]): ").strip().lower()
+    if mode not in ["quick", "deep"]:
+        mode = "quick"
+
+    disc = console.input("[cyan]Discovery method ([b]nmap[/b]/[b]arp[/b]) [nmap]: ").strip().lower() or "nmap"
+    if disc not in ["nmap", "arp"]:
+        disc = "nmap"
+
+    ssid = get_wifi_ssid()
+    console.print(f"[blue]Connected Wi-Fi SSID: {ssid}[/blue]")
+
+    devices = scan_network(mode=mode, discovery_method=disc)
+    communications = capture_traffic(duration=CONFIG.get("sniff_seconds", 60))
+
+    subnets = detect_subnets(devices)
+    if subnets:
+        console.print(f"[cyan]Detected private subnets: {', '.join(sorted(subnets))}[/cyan]")
+
+    console.print("[green]\\n✔ Scan complete. Generating report...[/green]")
+    generate_report(devices, communications)
+
+if __name__ == "__main__":
+    main()
+
+'''
+
+
+
+
+
+'''
+# ZeroTrace — Combined Network & Access Point Scanner
+import scapy.all as scapy
+import socket
+import ipaddress
+import nmap
+import os
+import ctypes
+import platform
+import subprocess
+import time
+from rich.console import Console
+from rich.table import Table
+from rich.progress import Progress
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
+import requests
+import openpyxl
+import re
+import shutil
+
+console = Console()
+
+# ----------------------
+# Config
+# ----------------------
+CONFIG = {
+    "sniff_seconds": 60, # Adjust duration of packet capture here
+    "excel_output": "zerotrace_report.xlsx", # Can change output filename here
+    "device_processing_timeout": 10,   # seconds allowed per device when generating report
+    "device_thread_workers": 20,       # parallelism for report generation
+    "scan_thread_workers": 30,         # parallelism for scanning
+}
+
+# ----------------------
+# Quick OUI Vendor Map (local fallback)
+# ----------------------
+OUI_VENDOR_MAP = {
+    "B8:27:EB": "Raspberry Pi Foundation",
+    "DC:A6:32": "Amazon Technologies",
+    "AC:63:BE": "Amazon Echo",
+    "3C:5A:B4": "Wyze Labs",
+    "F4:F5:D8": "Google Nest",
+    "D0:73:D5": "Google Smart Hub",
+    "00:1A:11": "Philips Hue",
+    "F0:27:2D": "TP-Link Technologies",
+    "60:01:94": "Xiaomi Communications",
+    "28:6D:97": "Samsung Electronics",
+    "00:16:6C": "Sony Corporation",
+    "F0:18:98": "Apple, Inc."
+}
+
+# ----------------------
+# Utility: Check admin privileges
+# ----------------------
+def is_admin():
+    try:
+        return os.getuid() == 0  # Linux / macOS
+    except AttributeError:
+        try:
+            return ctypes.windll.shell32.IsUserAnAdmin() != 0  # Windows
+        except Exception:
+            return False
+
+# ----------------------
+# Improved MAC Vendor Lookup
+# ----------------------
+def mac_vendor_lookup(mac):
+    if not mac:
+        return "Unknown Vendor"
+    mac_norm = mac.upper().replace(":", "").replace("-", "")
+    oui = mac_norm[:6]
+    prefix = ":".join([oui[i:i+2] for i in range(0, 6, 2)])
+    vendor = OUI_VENDOR_MAP.get(prefix) or OUI_VENDOR_MAP.get(oui)
+    if vendor:
+        return vendor
+    try:
+        url = f"https://api.macvendors.com/{mac}"
+        r = requests.get(url, timeout=4)
+        if r.status_code == 200 and r.text:
+            return r.text.strip()
+    except Exception:
+        pass
+    return "Unknown Vendor"
+
+# ----------------------
+# Hostname / Custom Name detection
+# ----------------------
+def get_reverse_dns(ip):
+    try:
+        name = socket.gethostbyaddr(ip)[0]
+        return name
+    except Exception:
+        return None
+
+def get_nmap_hostnames(info):
+    try:
+        if info and isinstance(info, dict) and "hostnames" in info and info["hostnames"]:
+            for h in info["hostnames"]:
+                name = h.get("name")
+                if name:
+                    return name
+    except Exception:
+        pass
+    return None
+
+def get_netbios_name(ip):
+    if platform.system().lower() != "windows":
+        return None
+    try:
+        out = subprocess.check_output(["nbtstat", "-A", ip], universal_newlines=True, stderr=subprocess.DEVNULL, timeout=5)
+        m = re.search(r"^\s*([^\s<]+)\s+<00>\s+UNIQUE", out, re.I | re.M)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    return None
+
+def get_custom_name(ip, info):
+    rdns = get_reverse_dns(ip)
+    if rdns and rdns != ip:
+        return rdns
+    nmname = get_nmap_hostnames(info)
+    if nmname:
+        return nmname
+    nb = get_netbios_name(ip)
+    if nb:
+        return nb
+    return "Unknown"
+
+# ----------------------
+# Ping Latency
+# ----------------------
+def ping_latency_ms(ip, attempts=2, timeout_ms=800):
+    try:
+        system = platform.system().lower()
+        if system == "windows":
+            cmd = ["ping", "-n", str(attempts), "-w", str(timeout_ms), ip]
+        else:
+            t = max(1, int(timeout_ms / 1000))
+            cmd = ["ping", "-c", str(attempts), "-W", str(t), ip]
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, universal_newlines=True,
+                              timeout=(attempts * (timeout_ms / 1000) + 3))
+        out = proc.stdout
+        if not out:
+            return None
+        if system == "windows":
+            m = re.search(r"Average = (\d+)ms", out)
+            if m:
+                return float(m.group(1))
+        else:
+            m = re.search(r"rtt [\w/]+ = [\d\.]+/([\d\.]+)/", out)
+            if m:
+                return float(m.group(1))
+    except Exception:
+        return None
+    return None
+
+# ----------------------
+# Wi-Fi SSID (local host)
+# ----------------------
+def get_wifi_ssid():
+    try:
+        system = platform.system().lower()
+        if system == "windows":
+            out = subprocess.check_output("netsh wlan show interfaces", shell=True, stderr=subprocess.DEVNULL,
+                                          universal_newlines=True, timeout=3)
+            m = re.search(r"SSID\s*:\s(.+)", out)
+            if m:
+                return m.group(1).strip()
+        else:
+            out = subprocess.check_output("iwgetid -r", shell=True, stderr=subprocess.DEVNULL,
+                                          universal_newlines=True, timeout=3).strip()
+            return out if out else "Unknown"
+    except Exception:
+        return "Unknown"
+
+# ----------------------
+# Access Point Detection
+# ----------------------
+def list_access_points():
+    system = platform.system().lower()
+    aps = []
+
+    if system == "windows":
+        try:
+            out = subprocess.check_output(
+                "netsh wlan show networks mode=bssid",
+                shell=True, universal_newlines=True, stderr=subprocess.DEVNULL
+            )
+            ssid, bssid, signal = None, None, None
+            for line in out.splitlines():
+                if "SSID" in line and "BSSID" not in line:
+                    ssid = line.split(":", 1)[1].strip()
+                elif "BSSID" in line:
+                    bssid = line.split(":", 1)[1].strip()
+                elif "Signal" in line:
+                    signal = line.split(":", 1)[1].strip()
+                    if ssid and bssid:
+                        aps.append({"ssid": ssid, "bssid": bssid, "signal": signal})
+        except Exception as e:
+            aps.append({"error": f"AP scan failed: {e}"})
+
+    elif system == "linux":
+        try:
+            out = subprocess.check_output(
+                "nmcli -t -f SSID,BSSID,SIGNAL dev wifi",
+                shell=True, universal_newlines=True, stderr=subprocess.DEVNULL
+            )
+            for line in out.strip().split("\n"):
+                parts = line.split(":")
+                if len(parts) >= 3:
+                    aps.append({"ssid": parts[0], "bssid": parts[1], "signal": parts[2]})
+        except Exception as e:
+            aps.append({"error": f"AP scan failed: {e}"})
+
+    return aps
+
+def current_connection():
+    system = platform.system().lower()
+    if system == "windows":
+        try:
+            out = subprocess.check_output(
+                "netsh wlan show interfaces",
+                shell=True, universal_newlines=True, stderr=subprocess.DEVNULL
+            )
+            ssid = re.search(r"SSID\s*:\s(.+)", out)
+            bssid = re.search(r"BSSID\s*:\s(.+)", out)
+            rate = re.search(r"Receive rate \(Mbps\)\s*:\s(.+)", out)
+            signal = re.search(r"Signal\s*:\s(.+)", out)
+            return {
+                "ssid": ssid.group(1).strip() if ssid else None,
+                "bssid": bssid.group(1).strip() if bssid else None,
+                "rate": rate.group(1).strip() if rate else None,
+                "signal": signal.group(1).strip() if signal else None
+            }
+        except Exception:
+            return {}
+    elif system == "linux":
+        try:
+            out = subprocess.check_output("iw dev wlan0 link", shell=True, universal_newlines=True,
+                                          stderr=subprocess.DEVNULL)
+            ssid = re.search(r"SSID: (.+)", out)
+            bssid = re.search(r"Connected to (.+)", out)
+            rate = re.search(r"tx bitrate: (.+)", out)
+            return {
+                "ssid": ssid.group(1).strip() if ssid else None,
+                "bssid": bssid.group(1).strip() if bssid else None,
+                "rate": rate.group(1).strip() if rate else None
+            }
+        except Exception:
+            return {}
+    return {}
+
+# ----------------------
+# Discovery helpers
+# ----------------------
+def arp_discover(network_cidr):
+    console.print(f"[cyan]Running ARP discovery on {network_cidr}...[/cyan]")
+    arp_request = scapy.ARP(pdst=network_cidr)
+    broadcast = scapy.Ether(dst="ff:ff:ff:ff:ff:ff")
+    arp_request_broadcast = broadcast/arp_request
+    answered = scapy.srp(arp_request_broadcast, timeout=2, verbose=False)[0]
+    devices = []
+    for _, received in answered:
+        devices.append({"ip": received.psrc, "mac": (received.hwsrc or "").upper(), "info": None})
+    console.print(f"[green]ARP discovered {len(devices)} devices[/green]")
+    return devices
+
+def nmap_discover(network_cidr):
+    nm = nmap.PortScanner()
+    devices = []
+    if not shutil.which("nmap"):
+        console.print("[yellow]nmap binary not found in PATH — falling back to ARP discovery[/yellow]")
+        return arp_discover(network_cidr)
+    try:
+        console.print(f"[cyan]Trying python-nmap discovery on {network_cidr}...[/cyan]")
+        nm.scan(hosts=network_cidr, arguments="-sn")
+        for host in nm.all_hosts():
+            try:
+                mac = nm[host]['addresses'].get('mac', '').upper()
+            except Exception:
+                mac = ""
+            devices.append({"ip": host, "mac": mac, "info": nm[host] if host in nm.all_hosts() else None})
+        console.print(f"[green]python-nmap discovered {len(devices)} hosts[/green]")
+        return devices
+    except Exception as e:
+        console.print(f"[yellow]python-nmap discovery failed: {e} — falling back to ARP[/yellow]")
+        return arp_discover(network_cidr)
+
+def get_discovered_devices(network_cidr, method="nmap"):
+    if method == "nmap":
+        return nmap_discover(network_cidr)
+    else:
+        return arp_discover(network_cidr)
+
+# ----------------------
+# Device scan (per-host Nmap)
+# ----------------------
+def scan_device(ip, mode="quick"):
+    nm = nmap.PortScanner()
+    try:
+        if mode == "quick":
+            args = "-sS -T4 --top-ports 20"
+        else:
+            args = "-sS -sV -O --top-ports 100 --osscan-guess --script vuln --max-retries 2"
+        nm.scan(ip, arguments=args, timeout=45)
+        return nm[ip] if ip in nm.all_hosts() else {}
+    except Exception as e:
+        console.print(f"[yellow][!] Scan error for {ip}: {e}[/yellow]")
+        return {}
+
+# ----------------------
+# Scan network (discovery + per-host scanning)
+# ----------------------
+def get_local_ip():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+    except Exception:
+        ip = None
+    finally:
+        s.close()
+    return ip
+
+def scan_network(mode="quick", discovery_method="nmap"):
+    local_ip = get_local_ip()
+    if not local_ip:
+        console.print("[red]Could not detect local IP. Exiting.[/red]")
+        return []
+    network_cidr = str(ipaddress.ip_network(f"{local_ip}/24", strict=False))
+    console.print(f"[blue]Using discovery range: {network_cidr}[/blue]")
+    discovered = get_discovered_devices(network_cidr, method=discovery_method)
+    console.print(f"[cyan]Beginning detailed scans for {len(discovered)} discovered devices...[/cyan]")
+    results = []
+    with Progress() as progress:
+        task = progress.add_task("[green]Scanning devices...", total=len(discovered))
+        with ThreadPoolExecutor(max_workers=CONFIG["scan_thread_workers"]) as executor:
+            future_to_dev = {executor.submit(scan_device, d["ip"], mode): d for d in discovered}
+            for future in as_completed(future_to_dev):
+                dev = future_to_dev[future]
+                try:
+                    info = future.result(timeout=60)
+                except Exception as e:
+                    console.print(f"[red][!] Error scanning {dev['ip']}: {e}[/red]")
+                    info = {}
+                results.append({"ip": dev["ip"], "mac": dev.get("mac", ""), "info": info})
+                progress.update(task, advance=1)
+    return results
+
+# ----------------------
+# Phase 2: Traffic Capture
+# ----------------------
+def capture_traffic(duration=60):
+    console.print(f"[cyan]Sniffing network traffic for {duration} seconds...[/cyan]")
+    try:
+        packets = scapy.sniff(timeout=duration)
+    except Exception as e:
+        console.print(f"[yellow]Sniff failed ({e}); continuing without traffic capture[/yellow]")
+        packets = []
+    communications = defaultdict(set)
+    for pkt in packets:
+        if pkt.haslayer(scapy.IP):
+            try:
+                src = pkt[scapy.IP].src
+                dst = pkt[scapy.IP].dst
+                communications[src].add(dst)
+                communications[dst].add(src)
+            except Exception:
+                continue
+    return communications
+
+# ----------------------
+# Risk Analysis
+# ----------------------
+def analyze_risks(info):
+    if not info:
+        return ["Unreachable"]
+    risks = []
+    risky_ports = {
+        21: "FTP (insecure)",
+        23: "Telnet (plaintext)",
+        25: "SMTP exposed",
+        53: "DNS tunneling risk",
+        111: "RPC exploit",
+        135: "MS RPC risk",
+        139: "NetBIOS exploit",
+        445: "SMB vulnerability",
+        3389: "RDP exposed",
+        5900: "VNC exposed"
+    }
+    try:
+        protocols = info.all_protocols() if info else []
+    except Exception:
+        protocols = []
+    for proto in protocols:
+        ports = info.get(proto, {}) if isinstance(info, dict) else info.get(proto, {})
+        for port, svc in ports.items():
+            try:
+                state = svc.get("state", "") if isinstance(svc, dict) else ""
+            except Exception:
+                state = ""
+            if state == "open":
+                if port in risky_ports:
+                    risks.append(f"Critical: {risky_ports[port]}")
+                elif port in (80, 8080, 8443):
+                    risks.append("Medium: Web interface exposed")
+                elif port == 22:
+                    risks.append("Medium: SSH exposed")
+                elif port in (1900, 5353):
+                    risks.append("IoT protocol exposed")
+    if not risks:
+        risks.append("No major risks detected")
+    return risks
+
+# ----------------------
+# Subnet detection
+# ----------------------
+def detect_subnets(devices):
+    subnets = set()
+    for d in devices:
+        try:
+            ip = ipaddress.ip_address(d["ip"])
+            if ip.is_private:
+                net = ipaddress.ip_network(f"{ip}/24", strict=False)
+                subnets.add(str(net))
+        except Exception:
+            pass
+    return subnets
+
+# ----------------------
+# Per-device processing worker
+# ----------------------
+def process_device(dev, communications):
+    ip = str(dev.get("ip", "Unknown"))
+    mac = (dev.get("mac") or "").upper()
+    info = dev.get("info") or {}
+
+    vendor = mac_vendor_lookup(mac)
+    custom_name = get_custom_name(ip, info)
+
+    role = "Generic Device"
+    os_name = "Unknown"
+    try:
+        if isinstance(info, dict) and "osmatch" in info and info["osmatch"]:
+            os_name = info["osmatch"][0].get("name", "Unknown")
+        elif isinstance(info, dict) and "osclass" in info and info["osclass"]:
+            os_name = info["osclass"][0].get("osfamily", "Unknown")
+    except Exception:
+        os_name = "Unknown"
+
+    latency = ping_latency_ms(ip)
+    latency_str = f"{latency:.1f}" if latency else "N/A"
+
+    risks = analyze_risks(info)
+    risks_str = "; ".join(risks)
+
+    ports = []
+    try:
+        if hasattr(info, "all_protocols"):
+            protocols = info.all_protocols()
+        elif isinstance(info, dict):
+            protocols = list(info.keys())
+        else:
+            protocols = []
+        for proto in protocols:
+            proto_ports = info.get(proto, {}) if isinstance(info, dict) else {}
+            for p, svc in proto_ports.items():
+                svc_name = svc.get("name", "?") if isinstance(svc, dict) else "?"
+                ports.append(f"{p}/{proto} ({svc_name})")
+    except Exception:
+        ports = []
+
+    comms = []
+    try:
+        if ip in communications:
+            for peer in communications[ip]:
+                if peer != ip:
+                    label = "Internal" if ipaddress.ip_address(peer).is_private else "External"
+                    comms.append(f"{peer} [{label}]")
+    except Exception:
+        comms = []
+
+    return {
+        "ip": ip,
+        "mac": mac,
+        "vendor": vendor,
+        "custom_name": custom_name,
+        "role": role,
+        "os_name": os_name,
+        "latency_str": latency_str,
+        "ports": ports,
+        "risks_str": risks_str,
+        "comms_str": ", ".join(comms) if comms else "No traffic observed"
+    }
+
+# ----------------------
+# Report generation & Excel export
+# ----------------------
+def generate_report(devices, communications):
+    table = Table(title="ZeroTrace Network Report")
+    table.add_column("IP", style="cyan")
+    table.add_column("MAC", style="magenta")
+    table.add_column("Vendor", style="green")
+    table.add_column("Custom Name", style="yellow")
+    table.add_column("Role", style="blue")
+    table.add_column("OS", style="cyan")
+    table.add_column("Latency (ms)", style="magenta")
+    table.add_column("Risks", style="red")
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Scan Report"
+    ws.append([
+        "IP", "MAC", "Vendor", "Custom Name", "Role", "OS", "Latency (ms)",
+        "Open Ports", "Risks", "Communications"
+    ])
+
+    total = len(devices)
+    console.print(f"[cyan]Generating report for {total} devices...[/cyan]")
+
+    with ThreadPoolExecutor(max_workers=CONFIG["device_thread_workers"]) as executor:
+        futures = {executor.submit(process_device, dev, communications): dev for dev in devices}
+        processed = 0
+        for future in as_completed(futures):
+            dev = futures[future]
+            processed += 1
+            try:
+                result = future.result(timeout=CONFIG["device_processing_timeout"])
+            except TimeoutError:
+                result = {
+                    "ip": str(dev.get("ip", "Unknown")),
+                    "mac": str(dev.get("mac", "")).upper(),
+                    "vendor": "Unknown (timeout)",
+                    "custom_name": "Unknown",
+                    "role": "Unknown",
+                    "os_name": "Unknown",
+                    "latency_str": "N/A",
+                    "ports": [],
+                    "risks_str": "Processing timed out",
+                    "comms_str": "Unknown"
+                }
+
+            table.add_row(
+                str(result["ip"]),
+                str(result["mac"]),
+                str(result["vendor"]),
+                str(result["custom_name"]),
+                str(result["role"]),
+                str(result["os_name"]),
+                str(result["latency_str"]),
+                str(result["risks_str"])
+            )
+            ws.append([
+                str(result["ip"]),
+                str(result["mac"]),
+                str(result["vendor"]),
+                str(result["custom_name"]),
+                str(result["role"]),
+                str(result["os_name"]),
+                str(result["latency_str"]),
+                str(", ".join(result["ports"]) if result["ports"] else "None"),
+                str(result["risks_str"]),
+                str(result["comms_str"])
+            ])
+            console.print(f"[blue]✔ Processed {processed}/{total}: {result['ip']}[/blue]")
+
+    # Add Access Point info
+    aps = list_access_points()
+    cur = current_connection()
+    if aps:
+        ws_ap = wb.create_sheet("Access Points")
+        ws_ap.append(["SSID", "BSSID", "Signal"])
+        for ap in aps:
+            if "error" in ap:
+                ws_ap.append([ap["error"], "", ""])
+            else:
+                ws_ap.append([ap["ssid"], ap["bssid"], ap["signal"]])
+        if cur:
+            ws_ap.append([])
+            ws_ap.append(["Current Connection"])
+            ws_ap.append(["SSID", cur.get("ssid", ""), cur.get("bssid", ""), cur.get("rate", ""), cur.get("signal", "")])
+
+    console.print(table)
+    try:
+        wb.save(CONFIG["excel_output"])
+        console.print(f"[green]✔ Report saved to {os.path.abspath(CONFIG['excel_output'])}[/green]")
+    except Exception as e:
+        console.print(f"[red]Failed to save Excel file: {e}[/red]")
+
+# ----------------------
+# Main
+# ----------------------
+def main():
+    admin = is_admin()
+    if admin:
+        console.print("[green]✔ Running with administrator privileges[/green]")
+    else:
+        console.print("[red]✖ Not running as administrator (some features may fail)[/red]")
+
+    mode = console.input("[cyan]Choose scan mode ([b]quick[/b]/[b]deep[/b]): ").strip().lower()
+    if mode not in ["quick", "deep"]:
+        mode = "quick"
+
+    disc = console.input("[cyan]Discovery method ([b]nmap[/b]/[b]arp[/b]) [nmap]: ").strip().lower() or "nmap"
+    if disc not in ["nmap", "arp"]:
+        disc = "nmap"
+
+    ssid = get_wifi_ssid()
+    console.print(f"[blue]Connected Wi-Fi SSID: {ssid}[/blue]")
+
+    devices = scan_network(mode=mode, discovery_method=disc)
+    communications = capture_traffic(duration=CONFIG.get("sniff_seconds", 60))
+
+    subnets = detect_subnets(devices)
+    if subnets:
+        console.print(f"[cyan]Detected private subnets: {', '.join(sorted(subnets))}[/cyan]")
+
+    console.print("[green]\\n✔ Scan complete. Generating report...[/green]")
+    generate_report(devices, communications)
+
+if __name__ == "__main__":
+    main()
+
+'''
+
+
+
+
+
+'''
+
+import os
+import re
+import ipaddress
+import platform
+import socket
+import subprocess
+import ctypes
+import shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+
+import scapy.all as scapy
+import nmap
+import openpyxl
+import requests
+from rich.console import Console
+from rich.table import Table
+from rich.progress import Progress, BarColumn, SpinnerColumn, TimeRemainingColumn
+
+console = Console()
+
+CONFIG = {
+    "excel_output": "zerotrace_report.xlsx",
+    "device_thread_workers": 20,
+}
+
+# ------------------------------------------------------------------------------------
+#  LOAD LOCAL OUI FILE
+# ------------------------------------------------------------------------------------
+OUI_VENDOR_MAP = {}
+OUI_FILE_PATH = os.path.join(os.path.dirname(__file__), "oui.txt")
+
+def load_oui_file():
+    global OUI_VENDOR_MAP
+    if not os.path.exists(OUI_FILE_PATH):
+        console.print("[yellow]OUI file not found; vendor lookups may be limited.[/yellow]")
+        return
+    try:
+        with open(OUI_FILE_PATH, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                if "(hex)" in line:
+                    parts = line.strip().split("(hex)")
+                    if len(parts) == 2:
+                        prefix = parts[0].strip().replace("-", "").replace(":", "").upper()[:6]
+                        vendor = parts[1].strip()
+                        if prefix:
+                            OUI_VENDOR_MAP[prefix] = vendor
+        console.print(f"[green]✔ Loaded {len(OUI_VENDOR_MAP):,} OUIs from oui.txt[/green]")
+    except Exception as e:
+        console.print(f"[red]Failed to load OUI file: {e}[/red]")
+
+def mac_vendor_lookup(mac):
+    if not mac:
+        return "Unknown Vendor"
+    mac_norm = mac.upper().replace("-", "").replace(":", "")
+    prefix = mac_norm[:6]
+    if prefix in OUI_VENDOR_MAP:
+        return OUI_VENDOR_MAP[prefix]
+    try:
+        r = requests.get(f"https://api.macvendors.com/{mac}", timeout=3)
+        if r.status_code == 200 and r.text.strip():
+            return r.text.strip()
+    except Exception:
+        pass
+    return "Unknown Vendor"
+
+# ------------------------------------------------------------------------------------
+#  SYSTEM HELPERS
+# ------------------------------------------------------------------------------------
+def is_admin():
+    try:
+        return os.getuid() == 0
+    except AttributeError:
+        return ctypes.windll.shell32.IsUserAnAdmin() != 0
+
+def get_local_ip():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except Exception:
+        return None
+    finally:
+        s.close()
+
+# ------------------------------------------------------------------------------------
+#  DISCOVERY METHODS
+# ------------------------------------------------------------------------------------
+def arp_discover(network_cidr):
+    console.print(f"[cyan]Running ARP discovery on {network_cidr}...[/cyan]")
+    arp = scapy.ARP(pdst=network_cidr)
+    broadcast = scapy.Ether(dst="ff:ff:ff:ff:ff:ff")
+    packet = broadcast / arp
+    answered = scapy.srp(packet, timeout=3, verbose=False)[0]
+    devices = []
+    for _, r in answered:
+        devices.append({"ip": r.psrc, "mac": (r.hwsrc or "").upper()})
+    console.print(f"[green]ARP discovered {len(devices)} devices[/green]")
+    return devices
+
+def nmap_discover(network_cidr):
+    nm = nmap.PortScanner()
+    if not shutil.which("nmap"):
+        console.print("[yellow]nmap not found; using ARP instead.[/yellow]")
+        return arp_discover(network_cidr)
+    console.print(f"[cyan]Running Nmap discovery on {network_cidr}...[/cyan]")
+    nm.scan(hosts=network_cidr, arguments="-sn")
+    devices = []
+    for host in nm.all_hosts():
+        mac = nm[host]["addresses"].get("mac", "").upper() if "addresses" in nm[host] else ""
+        devices.append({"ip": host, "mac": mac})
+    console.print(f"[green]Nmap discovered {len(devices)} hosts[/green]")
+    return devices
+
+# ------------------------------------------------------------------------------------
+#  SCAN & CLASSIFICATION
+# ------------------------------------------------------------------------------------
+def ping_device(ip):
+    try:
+        out = subprocess.check_output(["ping", "-n", "3", ip], universal_newlines=True, stderr=subprocess.DEVNULL)
+        m_avg = re.search(r"Average = (\d+)ms", out)
+        m_loss = re.search(r"Lost = \d+, *\( *(\d+)% loss", out)
+        latency = float(m_avg.group(1)) if m_avg else None
+        loss = float(m_loss.group(1)) if m_loss else None
+        return latency, loss
+    except Exception:
+        return None, None
+
+def nmap_scan_host(ip, mode="quick"):
+    nm = nmap.PortScanner()
+    try:
+        args = "-sS -T4 --top-ports 25" if mode == "quick" else "-sS -sV -O --osscan-guess --top-ports 200 --script vuln"
+        nm.scan(ip, arguments=args, timeout=60)
+        return nm[ip] if ip in nm.all_hosts() else None
+    except Exception:
+        return None
+
+def reverse_dns(ip):
+    try:
+        return socket.gethostbyaddr(ip)[0]
+    except Exception:
+        return None
+
+def netbios_name(ip):
+    """Use Windows nbtstat to get NetBIOS name."""
+    try:
+        out = subprocess.check_output(["nbtstat", "-A", ip], stderr=subprocess.DEVNULL, universal_newlines=True, timeout=4)
+        m = re.search(r"^\s*([A-Z0-9_\-]+)\s+<00>", out, re.MULTILINE)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    return None
+
+def infer_role(vendor, osname, open_ports):
+    v = vendor.lower()
+    o = osname.lower()
+    ports = set(open_ports)
+    if any(p in ports for p in (554, 8554, 8081)) or "camera" in o or "hikvision" in v:
+        return "IP Camera"
+    if "iphone" in o or "ios" in o or "ipad" in o or "apple" in v:
+        return "iPhone/iPad"
+    if "android" in o or "samsung" in v or "xiaomi" in v:
+        return "Android Phone"
+    if any(k in v for k in ("hp", "dell", "lenovo", "microsoft")) or "windows" in o:
+        return "Laptop/Desktop"
+    if any(p in ports for p in (22, 80, 443)) and "linux" in o:
+        return "Server/Linux Host"
+    if "roku" in v or "amazon" in v or "chromecast" in v:
+        return "Streaming Device"
+    if "printer" in v or 9100 in ports:
+        return "Printer"
+    if any(k in v for k in ("tp-link", "cisco", "netgear", "arris", "eero")):
+        return "Router/Switch"
+    if any(k in v for k in ("nest", "philips hue", "wyze", "tado", "google nest")):
+        return "Smart Home Device"
+    return "Generic Device"
+
+def enrich_device(d, mode="quick"):
+    ip = d.get("ip")
+    mac = d.get("mac", "")
+    vendor = mac_vendor_lookup(mac)
+
+    hostname = reverse_dns(ip) or netbios_name(ip) or "Unknown"
+    nmdata = nmap_scan_host(ip, mode)
+    osname = "Unknown"
+    open_ports = []
+    vulns = []
+
+    if nmdata:
+        if nmdata.get("osmatch"):
+            osname = nmdata["osmatch"][0].get("name", "Unknown")
+        elif nmdata.get("osclass"):
+            osname = nmdata["osclass"][0].get("osfamily", "Unknown")
+        tcp = nmdata.get("tcp", {})
+        for p, info in tcp.items():
+            if info.get("state") == "open":
+                open_ports.append(int(p))
+        if nmdata.get("hostscript"):
+            for s in nmdata["hostscript"]:
+                vulns.append(f"{s.get('id')}: {s.get('output')}")
+
+    latency, loss = ping_device(ip)
+    role = infer_role(vendor, osname, open_ports)
+
+    return {
+        "ip": ip,
+        "mac": mac,
+        "vendor": vendor,
+        "hostname": hostname,
+        "os": osname,
+        "latency": f"{latency:.1f} ms" if latency else "N/A",
+        "packet_loss": f"{loss:.0f}%" if loss else "N/A",
+        "open_ports": ", ".join(map(str, open_ports)) if open_ports else "None",
+        "role": role,
+        "vulnerabilities": "; ".join(vulns) if vulns else "None",
+    }
+
+# ------------------------------------------------------------------------------------
+#  REPORT
+# ------------------------------------------------------------------------------------
+def generate_report(devices):
+    headers = ["IP", "MAC", "Vendor", "Device Name", "OS", "Role", "Latency", "Packet Loss", "Open Ports", "Vulnerabilities"]
+    table = Table(title="ZeroTrace Network Summary", show_lines=False)
+    for h in headers:
+        table.add_column(h, overflow="fold")
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Scan Report"
+    ws.append(headers)
+
+    for dev in devices:
+        row = [
+            dev.get("ip", ""),
+            dev.get("mac", ""),
+            dev.get("vendor", ""),
+            dev.get("hostname", ""),
+            dev.get("os", ""),
+            dev.get("role", ""),
+            dev.get("latency", ""),
+            dev.get("packet_loss", ""),
+            dev.get("open_ports", ""),
+            dev.get("vulnerabilities", "")
+        ]
+        ws.append(row)
+        table.add_row(*map(str, row))
+
+    wb.save(CONFIG["excel_output"])
+    console.print(table)
+    console.print(f"[green]✔ Report saved to {os.path.abspath(CONFIG['excel_output'])}[/green]")
+
+# ------------------------------------------------------------------------------------
+#  MAIN
+# ------------------------------------------------------------------------------------
+def main():
+    console.print("[bold cyan]ZeroTrace Enterprise Network Scanner[/bold cyan]")
+    load_oui_file()
+
+    mode = console.input("[cyan]Scan mode ([b]quick[/b]/[b]deep[/b]/[b]both[/b]): ").strip().lower() or "quick"
+    disc = console.input("[cyan]Discovery method ([b]nmap[/b]/[b]arp[/b]/[b]both[/b]) [nmap]: ").strip().lower() or "nmap"
+
+    local_ip = get_local_ip()
+    if not local_ip:
+        console.print("[red]Could not determine local IP address.[/red]")
+        return
+    network_cidr = str(ipaddress.ip_network(f"{local_ip}/24", strict=False))
+    console.print(f"[blue]Scanning subnet: {network_cidr}[/blue]")
+
+    if disc == "arp":
+        devices = arp_discover(network_cidr)
+    elif disc == "nmap":
+        devices = nmap_discover(network_cidr)
+    else:
+        arp_list = arp_discover(network_cidr)
+        nmap_list = nmap_discover(network_cidr)
+        ipmap = {d["ip"]: d for d in arp_list}
+        for n in nmap_list:
+            if n["ip"] not in ipmap:
+                ipmap[n["ip"]] = n
+            elif not ipmap[n["ip"]].get("mac"):
+                ipmap[n["ip"]]["mac"] = n.get("mac", "")
+        devices = list(ipmap.values())
+
+    if not devices:
+        console.print("[red]No devices discovered.[/red]")
+        return
+
+    console.print(f"[cyan]Discovered {len(devices)} devices — scanning in {mode} mode...[/cyan]")
+    enriched = []
+    with Progress(SpinnerColumn(), "[progress.description]{task.description}", BarColumn(), "{task.completed}/{task.total}", TimeRemainingColumn()) as progress:
+        task = progress.add_task("Scanning devices", total=len(devices))
+        with ThreadPoolExecutor(max_workers=CONFIG["device_thread_workers"]) as ex:
+            futures = {ex.submit(enrich_device, d, "deep" if mode in ("deep", "both") else "quick"): d for d in devices}
+            for f in as_completed(futures):
+                try:
+                    enriched.append(f.result())
+                except Exception:
+                    enriched.append(futures[f])
+                progress.update(task, advance=1)
+
+    generate_report(enriched)
+
+if __name__ == "__main__":
+    main()
+    
+    '''
+    
+    
+import os
+import re
+import ipaddress
+import platform
+import socket
+import subprocess
+import ctypes
+import shutil
+import json
+from datetime import datetime
+from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Optional
+
+# Third-party libs (must be installed)
+import scapy.all as scapy
+import nmap
+import openpyxl
+import requests
+from rich.console import Console
+from rich.table import Table
+from rich.progress import Progress, SpinnerColumn, BarColumn, TimeRemainingColumn
+
+console = Console()
+
+# ---------------------------
+# Config
+# ---------------------------
+CONFIG = {
+    "excel_output": "zerotrace_report.xlsx",
+    "device_thread_workers": 20,
+    "scan_thread_workers": 30,
+    "ping_count": 3,
+    "nmap_timeout": 60,         # per-host timeout for nmap
+    "max_service_version_len": 120
+}
+
+# ---------------------------
+# OUI vendor map loading
+# ---------------------------
+OUI_VENDOR_MAP = {}
+OUI_FILE_PATH = os.path.join(os.path.dirname(__file__), "oui.txt")
+
+def load_oui_file():
+    """Load IEEE OUI file (standards-oui.ieee.org format)."""
+    global OUI_VENDOR_MAP
+    if not os.path.exists(OUI_FILE_PATH):
+        console.print("[yellow]oui.txt not found — vendor lookups may be limited.[/yellow]")
+        return
+    try:
+        count = 0
+        with open(OUI_FILE_PATH, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                # typical IEEE format: "00-11-22   (hex)    Vendor Name"
+                if "(hex)" in line:
+                    parts = line.strip().split("(hex)")
+                    if len(parts) == 2:
+                        prefix = parts[0].strip().replace("-", "").replace(":", "").upper()[:6]
+                        vendor = parts[1].strip()
+                        if prefix:
+                            OUI_VENDOR_MAP[prefix] = vendor
+                            count += 1
+        console.print(f"[green]✔ Loaded {count:,} OUIs from oui.txt[/green]")
+    except Exception as e:
+        console.print(f"[red]Failed to load OUI file: {e}[/red]")
+
+def mac_vendor_lookup(mac: str) -> tuple[str, int]:
+    """
+    Return (vendor_name, confidence_percent).
+    Confidence:
+      - 95-100%: matched via local OUI file
+      - 80%: matched via external API
+      - 30-50%: heuristics (partial match)
+      - 0%: unknown
+    """
+    if not mac:
+        return ("Unknown Vendor", 0)
+    mac_norm = mac.upper().replace(":", "").replace("-", "")
+    prefix = mac_norm[:6]
+    vendor = OUI_VENDOR_MAP.get(prefix)
+    if vendor:
+        return (vendor, 98)
+    # try external API
+    try:
+        r = requests.get(f"https://api.macvendors.com/{mac}", timeout=3)
+        if r.status_code == 200 and r.text.strip():
+            return (r.text.strip(), 80)
+    except Exception:
+        pass
+    # heuristic: try partial OUI match (first 5 hex chars) maybe lower confidence
+    try:
+        for k, v in OUI_VENDOR_MAP.items():
+            if mac_norm.startswith(k[:5]):
+                return (v, 40)
+    except Exception:
+        pass
+    return ("Unknown Vendor", 0)
+
+# ---------------------------
+# System / Network helpers
+# ---------------------------
+def is_admin() -> bool:
+    try:
+        return os.getuid() == 0
+    except AttributeError:  # windows
+        try:
+            return ctypes.windll.shell32.IsUserAnAdmin() != 0
+        except Exception:
+            return False
+def get_local_ip() -> Optional[str]:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except Exception:
+        return None
+    finally:
+        s.close()
+        s.close()
+
+def get_wifi_ssid() -> Optional[str]:
+    """Return SSID if connected to Wi-Fi on Windows (or Linux)."""
+    try:
+        system = platform.system().lower()
+        if system == "windows":
+            out = subprocess.check_output("netsh wlan show interfaces", shell=True, universal_newlines=True, stderr=subprocess.DEVNULL)
+            m = re.search(r"SSID\s*:\s(.+)", out)
+            return m.group(1).strip() if m else None
+        else:
+            out = subprocess.check_output("iwgetid -r", shell=True, universal_newlines=True, stderr=subprocess.DEVNULL)
+            s = out.strip()
+            return s or None
+    except Exception:
+        return None
+
+def get_connection_type() -> str:
+    """Naive check: if SSID present => Wi-Fi, else check ethernet state on Windows."""
+    try:
+        ssid = get_wifi_ssid()
+        if ssid:
+            return "Wi-Fi"
+        system = platform.system().lower()
+        if system == "windows":
+            out = subprocess.check_output("netsh interface show interface", shell=True, universal_newlines=True, stderr=subprocess.DEVNULL)
+            if "Ethernet" in out and "Connected" in out:
+                return "Ethernet"
+    except Exception:
+        pass
+    return "Unknown"
+
+# ---------------------------
+# Discovery methods
+# ---------------------------
+def arp_discover(network_cidr: str):
+    console.print(f"[cyan]Running ARP discovery on {network_cidr}...[/cyan]")
+    arp = scapy.ARP(pdst=network_cidr)
+    ether = scapy.Ether(dst="ff:ff:ff:ff:ff:ff")
+    packet = ether/arp
+    try:
+        answered = scapy.srp(packet, timeout=3, verbose=False)[0]
+    except Exception as e:
+        console.print(f"[yellow]ARP failed: {e}[/yellow]")
+        return []
+    devices = []
+    for _, r in answered:
+        devices.append({"ip": r.psrc, "mac": (r.hwsrc or "").upper(), "info": None})
+    console.print(f"[green]ARP discovered {len(devices)} devices[/green]")
+    return devices
+
+def nmap_discover(network_cidr: str):
+    nm = nmap.PortScanner()
+    if not shutil.which("nmap"):
+        console.print("[yellow]nmap binary not found — falling back to ARP[/yellow]")
+        return arp_discover(network_cidr)
+    console.print(f"[cyan]Running nmap discovery (-sn) on {network_cidr}...[/cyan]")
+    try:
+        nm.scan(hosts=network_cidr, arguments="-sn")
+        devices = []
+        for host in nm.all_hosts():
+            mac = ""
+            try:
+                mac = nm[host]["addresses"].get("mac", "").upper()
+            except Exception:
+                mac = ""
+            devices.append({"ip": host, "mac": mac, "info": nm[host]})
+        console.print(f"[green]nmap discovered {len(devices)} hosts[/green]")
+        return devices
+    except Exception as e:
+        console.print(f"[yellow]nmap discovery error: {e} — using ARP[/yellow]")
+        return arp_discover(network_cidr)
+
+# ---------------------------
+# Per-host nmap wrapper (for deeper enrichment)
+# ---------------------------
+def nmap_scan_host(ip: str, mode: str = "quick"):
+    """Return parsed host object (or None). mode 'deep' uses version/os/vuln scripts."""
+    nm = nmap.PortScanner()
+    try:
+        if mode == "quick":
+            args = "-sS -T4 --top-ports 20 -Pn"
+        else:
+            # deep includes service/version, OS/fingerprinting and vuln scripts
+            args = "-sS -sV -O --osscan-guess --top-ports 200 --script vuln -Pn"
+        nm.scan(ip, arguments=args, timeout=CONFIG["nmap_timeout"])
+        if ip in nm.all_hosts():
+            return nm[ip]
+        return None
+    except Exception as e:
+        # nmap may raise on permissions or timeout
+        # return None, caller will handle
+        return None
+
+# ---------------------------
+# Ping helpers (latency + packet loss + ttl)
+# ---------------------------
+def ping_device(ip: str, count: int = None):
+    """Return (avg_ms, loss_percent, ttl) or (None, None, None). Windows-style ping parsing used."""
+    if count is None:
+        count = CONFIG["ping_count"]
+    system = platform.system().lower()
+    if system == "windows":
+        cmd = ["ping", "-n", str(count), ip]
+    else:
+        cmd = ["ping", "-c", str(count), ip]
+    try:
+        out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, universal_newlines=True, timeout=15)
+    except Exception:
+        return (None, None, None)
+    avg = None
+    loss = None
+    ttl = None
+    # Windows parse
+    if system == "windows":
+        m_avg = re.search(r"Average = (\d+)ms", out)
+        m_loss = re.search(r"Lost = \d+.*,\s+(\d+)% loss", out) or re.search(r"Lost = \d+.*,\s+Lost% = (\d+)%", out)
+        m_ttl = re.search(r"TTL=(\d+)", out)
+        if m_avg:
+            try:
+                avg = float(m_avg.group(1))
+            except Exception:
+                avg = None
+        if m_loss:
+            try:
+                loss = float(m_loss.group(1))
+            except Exception:
+                loss = None
+        if m_ttl:
+            try:
+                ttl = int(m_ttl.group(1))
+            except Exception:
+                ttl = None
+    else:
+        m_avg = re.search(r"rtt [\w/]+ = [\d\.]+/([\d\.]+)/", out)
+        m_loss = re.search(r"(\d+)% packet loss", out)
+        m_ttl = re.search(r"time=(?:[\d\.]+) ms\s+ttl=(\d+)", out) or re.search(r"ttl=(\d+)", out)
+        if m_avg:
+            try:
+                avg = float(m_avg.group(1))
+            except Exception:
+                avg = None
+        if m_loss:
+            try:
+                loss = float(m_loss.group(1))
+            except Exception:
+                loss = None
+        if m_ttl:
+            try:
+                ttl = int(m_ttl.group(1))
+            except Exception:
+                ttl = None
+    return (avg, loss, ttl)
+
+# ---------------------------
+# Role & OS inference + confidence scoring
+# ---------------------------
+def infer_role_and_confidence(vendor: str, os_name: str, open_ports: list, ttl: Optional[int]) -> tuple[str, int]:
+    """
+    Heuristic role inference using vendor, OS, ports, TTL.
+    Returns (role, confidence_percent)
+    """
+    v = (vendor or "").lower()
+    o = (os_name or "").lower()
+    ports = set(open_ports or [])
+    score = 40  # base
+
+    # strong indicators
+    if any(p in ports for p in (554, 8554, 5544)) or "camera" in o or "hikvision" in v or "axis" in v:
+        return ("IP Camera", 95)
+    if "printer" in v or 9100 in ports:
+        return ("Printer", 93)
+    if any(k in v for k in ("roku", "amazon", "chromecast", "philips")) or "smarttv" in o or "tv" in o:
+        return ("Smart TV / Streaming Device", 90)
+    if any(k in v for k in ("apple",)) or "ios" in o or "iphone" in o or "ipad" in o:
+        return ("Phone / Tablet (Apple)", 92)
+    if any(k in v for k in ("samsung", "xiaomi", "huawei")) or "android" in o:
+        return ("Phone / Tablet (Android)", 88)
+    if any(k in v for k in ("cisco", "juniper", "netgear", "tp-link", "arris", "eero", "luxul", "ubiquiti")):
+        return ("Router / Switch", 92)
+    if "windows" in o or any(k in v for k in ("dell", "hp", "lenovo", "microsoft")):
+        return ("Laptop / Desktop (Windows)", 85)
+    if "mac os" in o or "darwin" in o or any(k in v for k in ("apple")) and "iphone" not in o:
+        return ("Mac / macOS", 88)
+    if "linux" in o or any(k in v for k in ("raspberry", "ubuntu", "debian", "centos", "red hat", "redhat")):
+        # server vs IoT — if ports suggest server
+        if any(p in ports for p in (22, 80, 443, 3306, 5432)):
+            return ("Server / Linux Host", 90)
+        return ("Linux / Embedded", 75)
+
+    # TTL heuristics: many routers reply with TTL high/low? (weak)
+    if ttl is not None:
+        if ttl <= 64:
+            score += 5
+        elif ttl > 128:
+            score += 3
+
+    # port-based signals
+    if 22 in ports and not (80 in ports or 443 in ports):
+        return ("SSH Host / Appliance", 80)
+    if 80 in ports or 443 in ports:
+        return ("Web-Connected Device", 70)
+
+    # fallback
+    return ("Generic Device", min(95, score))
+
+def os_confidence_from_nmap(nmap_host):
+    """Return (os_guess, confidence). Heuristics: prefer nmap osmatch if present."""
+    if not nmap_host:
+        return ("Unknown", 0)
+    try:
+        # python-nmap exposes 'osmatch' as list
+        osmatch = nmap_host.get("osmatch", [])
+        if osmatch:
+            name = osmatch[0].get("name", "Unknown")
+            # nmap produces a 'accuracy' field sometimes
+            acc = osmatch[0].get("accuracy")
+            try:
+                conf = int(acc) if acc is not None else 85
+            except Exception:
+                conf = 85
+            return (name, conf)
+        # fallback to osclass
+        osclass = nmap_host.get("osclass", [])
+        if osclass:
+            fam = osclass[0].get("osfamily") or osclass[0].get("osgen") or "Unknown"
+            conf = osclass[0].get("accuracy") or 70
+            try:
+                conf = int(conf)
+            except Exception:
+                conf = 70
+            return (fam, conf)
+    except Exception:
+        pass
+    return ("Unknown", 0)
+
+# ---------------------------
+# Vulnerability extraction helpers
+# ---------------------------
+CVE_RE = re.compile(r"(CVE-\d{4}-\d{4,7})", re.IGNORECASE)
+
+def parse_nmap_scripts_for_cves(nmap_host):
+    """Extract CVE IDs and short descriptions from nmap hostscript output (if present)."""
+    results = []
+    # hostscript is usually list of dict { 'id': 'vuln', 'output': '... CVE-...' }
+    try:
+        hostscript = nmap_host.get("hostscript", []) if nmap_host else []
+    except Exception:
+        hostscript = []
+    for s in hostscript:
+        out = (s.get("output") or "")
+        # find CVE tokens
+        cves = CVE_RE.findall(out)
+        if cves:
+            for cve in sorted(set(cves)):
+                # extract small snippet containing cve
+                m = re.search(r".{0,80}"+re.escape(cve)+r".{0,80}", out, re.IGNORECASE)
+                snippet = m.group(0).strip() if m else out[:120].strip()
+                # form "CVE-xxxx-xxxx - snippet" (normalize newlines safely)
+                snippet_clean = snippet.replace("\n", " ").strip()
+                readable = f"{cve} - {snippet_clean}"
+                results.append(readable)
+        else:
+            # sometimes script output names a CVE-like description
+            if len(out) > 10:
+                results.append(out.strip()[:200])
+    # also check scripts listed in 'script' keys in services
+    try:
+        services = nmap_host.get("tcp", {}) if nmap_host else {}
+        for port, svc in services.items():
+            scripts = svc.get("script", {}) if isinstance(svc.get("script", {}), dict) else svc.get("script", [])
+            # script may be dict or list
+            if isinstance(scripts, dict):
+                for k, v in scripts.items():
+                    text = v if isinstance(v, str) else str(v)
+                    cves = CVE_RE.findall(text)
+                    if cves:
+                        for cve in sorted(set(cves)):
+                            m = re.search(r".{0,80}"+re.escape(cve)+r".{0,80}", text, re.IGNORECASE)
+                            snippet = m.group(0).strip() if m else text[:120].strip()
+                            snippet_clean = snippet.replace("\n", " ").strip()
+                            results.append(f"{cve} - {snippet_clean}")
+                    elif text:
+                        results.append(text.strip()[:200])
+            elif isinstance(scripts, list):
+                for item in scripts:
+                    text = item.get("output") if isinstance(item, dict) else str(item)
+                    cves = CVE_RE.findall(text)
+                    if cves:
+                        for cve in sorted(set(cves)):
+                            m = re.search(r".{0,80}"+re.escape(cve)+r".{0,80}", text, re.IGNORECASE)
+                            snippet = m.group(0).strip() if m else text[:120].strip()
+                            snippet_clean = snippet.replace("\n", " ").strip()
+                            results.append(f"{cve} - {snippet_clean}")
+                    elif text:
+                        results.append(text.strip()[:200])
+    except Exception:
+        pass
+
+    # dedupe & limit
+    seen = []
+    for r in results:
+        if r not in seen:
+            seen.append(r)
+    return seen[:10]
+
+# ---------------------------
+# Service versions summarization
+# ---------------------------
+def summarize_service_versions(nmap_host):
+    """Return short summary string of services/products and versions."""
+    if not nmap_host:
+        return "None"
+    services = []
+    try:
+        tcp = nmap_host.get("tcp", {}) or {}
+        for port_s, info in tcp.items():
+            try:
+                port = int(port_s)
+            except Exception:
+                continue
+            state = info.get("state", "")
+            if state != "open":
+                continue
+            name = info.get("name") or ""
+            product = info.get("product") or ""
+            version = info.get("version") or ""
+            extr = f"{product} {version}".strip()
+            if extr:
+                services.append(f"{port}/{name} ({extr})")
+            else:
+                services.append(f"{port}/{name}")
+    except Exception:
+        pass
+    if not services:
+        return "None"
+    joined = "; ".join(services)
+    if len(joined) > CONFIG["max_service_version_len"]:
+        joined = joined[:CONFIG["max_service_version_len"]-3] + "..."
+    return joined
+
+# ---------------------------
+# Per-device enrichment
+# ---------------------------
+def enrich_device(device: dict, mode: str = "quick"):
+    ip = device.get("ip")
+    mac = device.get("mac") or ""
+    result = {
+        "ip": ip,
+        "mac": mac,
+        "vendor": "Unknown",
+        "vendor_conf": 0,
+        "hostname": "",
+        "os": "Unknown",
+        "os_conf": 0,
+        "role": "Generic Device",
+        "role_conf": 0,
+        "latency_ms": "N/A",
+        "packet_loss": "N/A",
+        "ttl": None,
+        "open_ports": "None",
+        "services": "None",
+        "vulnerabilities": "None",
+        "discovered_at": datetime.utcnow().isoformat() + "Z",
+        "last_seen_at": datetime.utcnow().isoformat() + "Z"
+    }
+
+    # vendor
+    try:
+        vendor, vconf = mac_vendor_lookup(mac)
+        result["vendor"] = vendor
+        result["vendor_conf"] = vconf
+    except Exception:
+        pass
+
+    # ping
+    try:
+        avg, loss, ttl = ping_device(ip)
+        result["latency_ms"] = f"{avg:.1f} ms" if avg is not None else "N/A"
+        result["packet_loss"] = f"{loss:.0f}%" if loss is not None else "N/A"
+        result["ttl"] = ttl
+    except Exception:
+        pass
+
+    # nmap deep/quick
+    ndata = None
+    try:
+        ndata = nmap_scan_host(ip, mode)
+    except Exception:
+        ndata = None
+
+    # OS guess & confidence
+    try:
+        os_guess, os_conf = os_confidence_from_nmap(ndata)
+        result["os"] = os_guess or "Unknown"
+        result["os_conf"] = os_conf or 0
+    except Exception:
+        pass
+
+    # open ports & service versions
+    try:
+        sv = summarize_service_versions(ndata)
+        result["services"] = sv
+        # build open ports list
+        open_ports = []
+        if ndata:
+            tcp = ndata.get("tcp", {}) or {}
+            for p, info in tcp.items():
+                try:
+                    if info.get("state") == "open":
+                        open_ports.append(int(p))
+                except Exception:
+                    continue
+        result["open_ports"] = ", ".join(map(str, sorted(open_ports))) if open_ports else "None"
+    except Exception:
+        pass
+
+    # vulnerabilities / CVEs
+    try:
+        cves = parse_nmap_scripts_for_cves(ndata)
+        if cves:
+            result["vulnerabilities"] = "; ".join(cves)
+        else:
+            # heuristics: if dangerous ports open, flag potential issues
+            op = [int(p) for p in (result["open_ports"].split(", ") if result["open_ports"] and result["open_ports"] != "None" else []) if p]
+            weak_ports = []
+            if 23 in op:
+                weak_ports.append("Telnet open (plaintext)")
+            if 21 in op:
+                weak_ports.append("FTP open (plaintext)")
+            if 445 in op:
+                weak_ports.append("SMB exposed")
+            if weak_ports:
+                result["vulnerabilities"] = "; ".join(weak_ports)
+    except Exception:
+        pass
+
+    # hostname
+    try:
+        hostname = None
+        try:
+            hostname = socket.gethostbyaddr(ip)[0]
+        except Exception:
+            hostname = None
+        # netbios fallback (Windows)
+        if not hostname:
+            try:
+                nb = subprocess.check_output(["nbtstat", "-A", ip], universal_newlines=True, stderr=subprocess.DEVNULL, timeout=3)
+                m = re.search(r"^\s*([A-Z0-9_\-]+)\s+<00>", nb, re.MULTILINE)
+                if m:
+                    hostname = m.group(1)
+            except Exception:
+                hostname = hostname
+        result["hostname"] = hostname or ip
+    except Exception:
+        result["hostname"] = ip
+
+    # infer role with confidence
+    try:
+        open_ports_list = []
+        if result["open_ports"] and result["open_ports"] != "None":
+            open_ports_list = [int(p) for p in result["open_ports"].split(",") if p and p.strip().isdigit()]
+        role, rconf = infer_role_and_confidence(result["vendor"], result["os"], open_ports_list, result["ttl"])
+        result["role"] = role
+        result["role_conf"] = rconf
+    except Exception:
+        result["role"] = "Generic Device"
+        result["role_conf"] = 30
+
+    return result
+
+# ---------------------------
+# Parallel enrichment wrapper
+# ---------------------------
+def enrich_devices(devices: list, mode: str):
+    enriched = []
+    with ThreadPoolExecutor(max_workers=CONFIG["device_thread_workers"]) as ex:
+        futures = {ex.submit(enrich_device, d, mode): d for d in devices}
+        with Progress(SpinnerColumn(), "[progress.description]{task.description}", BarColumn(), "{task.completed}/{task.total}", TimeRemainingColumn()) as prog:
+            task = prog.add_task("Enriching devices", total=len(futures))
+            for fut in as_completed(futures):
+                try:
+                    enriched.append(fut.result())
+                except Exception:
+                    enriched.append(futures[fut])
+                prog.update(task, advance=1)
+    return enriched
+
+# ---------------------------
+# Export helpers (Excel/CSV/JSON)
+# ---------------------------
+def save_excel(devices: list, path: str):
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Scan Report"
+    headers = [
+        "IP", "MAC", "Vendor", "Vendor_Confidence", "Hostname",
+        "OS", "OS_Confidence", "Role", "Role_Confidence",
+        "Latency_ms", "Packet_Loss", "Open_Ports", "Services",
+        "Vulnerabilities", "Discovered_At", "Last_Seen"
+    ]
+    ws.append(headers)
+    for d in devices:
+        row = [
+            d.get("ip"), d.get("mac"), d.get("vendor"), d.get("vendor_conf"),
+            d.get("hostname"), d.get("os"), d.get("os_conf"),
+            d.get("role"), d.get("role_conf"),
+            d.get("latency_ms"), d.get("packet_loss"),
+            d.get("open_ports"), d.get("services"),
+            d.get("vulnerabilities"), d.get("discovered_at"), d.get("last_seen_at")
+        ]
+        ws.append(row)
+
+    # Access Points sheet
+    try:
+        aps = list_access_points()
+        if aps:
+            ws_ap = wb.create_sheet("Access Points")
+            ws_ap.append(["SSID", "BSSID", "Signal", "Type"])
+            ssid_groups = defaultdict(list)
+            for ap in aps:
+                ssid = ap.get("ssid") or "Unknown"
+                ssid_groups[ssid].append(ap)
+            for ap in aps:
+                ssid = ap.get("ssid") or "Unknown"
+                typ = "Mesh/Extender" if len(ssid_groups[ssid]) > 1 else "Primary"
+                ws_ap.append([ap.get("ssid"), ap.get("bssid"), ap.get("signal"), typ])
+            # If current connection, add
+            cur = current_connection()
+            if cur:
+                ws_ap.append([])
+                ws_ap.append(["Current Connection"])
+                ws_ap.append(["SSID", cur.get("ssid"), cur.get("bssid"), cur.get("rate"), cur.get("signal")])
+    except Exception:
+        pass
+
+    wb.save(path)
+    console.print(f"[green]✔ Excel saved to {os.path.abspath(path)}[/green]")
+
+def save_csv(devices: list, path: str):
+    import csv
+    headers = [
+        "IP", "MAC", "Vendor", "Vendor_Confidence", "Hostname",
+        "OS", "OS_Confidence", "Role", "Role_Confidence",
+        "Latency_ms", "Packet_Loss", "Open_Ports", "Services",
+        "Vulnerabilities", "Discovered_At", "Last_Seen"
+    ]
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(headers)
+        for d in devices:
+            w.writerow([
+                d.get("ip"), d.get("mac"), d.get("vendor"), d.get("vendor_conf"),
+                d.get("hostname"), d.get("os"), d.get("os_conf"),
+                d.get("role"), d.get("role_conf"),
+                d.get("latency_ms"), d.get("packet_loss"),
+                d.get("open_ports"), d.get("services"),
+                d.get("vulnerabilities"), d.get("discovered_at"), d.get("last_seen_at")
+            ])
+    console.print(f"[green]✔ CSV saved to {os.path.abspath(path)}[/green]")
+
+def save_json(devices: list, path: str):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(devices, f, indent=2)
+    console.print(f"[green]✔ JSON saved to {os.path.abspath(path)}[/green]")
+
+# ---------------------------
+# Wi-Fi/AP helpers (Windows-focused)
+# ---------------------------
+def list_access_points():
+    system = platform.system().lower()
+    aps = []
+    try:
+        if system == "windows":
+            out = subprocess.check_output("netsh wlan show networks mode=bssid", shell=True, universal_newlines=True, stderr=subprocess.DEVNULL)
+            ssid = None
+            bssid = None
+            signal = None
+            for line in out.splitlines():
+                if "SSID" in line and "BSSID" not in line:
+                    ssid = line.split(":", 1)[1].strip()
+                elif "BSSID" in line:
+                    bssid = line.split(":", 1)[1].strip()
+                elif "Signal" in line:
+                    signal = line.split(":", 1)[1].strip()
+                    if ssid and bssid:
+                        aps.append({"ssid": ssid, "bssid": bssid, "signal": signal})
+        else:
+            out = subprocess.check_output("nmcli -t -f SSID,BSSID,SIGNAL dev wifi", shell=True, universal_newlines=True, stderr=subprocess.DEVNULL)
+            for line in out.strip().split("\n"):
+                parts = line.split(":")
+                if len(parts) >= 3:
+                    aps.append({"ssid": parts[0], "bssid": parts[1], "signal": parts[2]})
+    except Exception:
+        pass
+    return aps
+
+def current_connection():
+    system = platform.system().lower()
+    if system == "windows":
+        try:
+            out = subprocess.check_output("netsh wlan show interfaces", shell=True, universal_newlines=True, stderr=subprocess.DEVNULL)
+            ssid = re.search(r"SSID\s*:\s(.+)", out)
+            bssid = re.search(r"BSSID\s*:\s(.+)", out)
+            rate = re.search(r"Receive rate \(Mbps\)\s*:\s(.+)", out)
+            signal = re.search(r"Signal\s*:\s(.+)", out)
+            return {
+                "ssid": ssid.group(1).strip() if ssid else None,
+                "bssid": bssid.group(1).strip() if bssid else None,
+                "rate": rate.group(1).strip() if rate else None,
+                "signal": signal.group(1).strip() if signal else None
+            }
+        except Exception:
+            return None
+    else:
+        try:
+            out = subprocess.check_output("iw dev wlan0 link", shell=True, universal_newlines=True, stderr=subprocess.DEVNULL)
+            ssid = re.search(r"SSID: (.+)", out)
+            bssid = re.search(r"Connected to (.+)", out)
+            rate = re.search(r"tx bitrate: (.+)", out)
+            return {
+                "ssid": ssid.group(1).strip() if ssid else None,
+                "bssid": bssid.group(1).strip() if bssid else None,
+                "rate": rate.group(1).strip() if rate else None
+            }
+        except Exception:
+            return None
+
+# ---------------------------
+# Main: Orchestration
+# ---------------------------
+def main():
+    console.print("[bold cyan]ZeroTrace Enhanced Scanner — v4[/bold cyan]")
+    admin = is_admin()
+    if admin:
+        console.print("[green]✔ Running with administrator privileges[/green]")
+    else:
+        console.print("[yellow]⚠ Not running as administrator — some scans (OS detection / vuln scripts) may be limited.[/yellow]")
+
+    load_oui_file()
+
+    conn_type = get_connection_type()
+    ssid = get_wifi_ssid() if conn_type == "Wi-Fi" else None
+    console.print(f"[blue]Connection type:[/] {conn_type}")
+    if ssid:
+        console.print(f"[blue]Connected SSID:[/] {ssid}")
+
+    # choose quick/deep/both
+    mode = console.input("[cyan]Scan mode ([b]quick[/b]/[b]deep[/b]/[b]both[/b]) [quick]: ").strip().lower() or "quick"
+    while mode not in ("quick", "deep", "both"):
+        mode = console.input("[cyan]Choose 'quick', 'deep' or 'both': ").strip().lower()
+
+    # choose discovery
+    disc = console.input("[cyan]Discovery method ([b]nmap[/b]/[b]arp[/b]/[b]both[/b]) [nmap]: ").strip().lower() or "nmap"
+    while disc not in ("nmap", "arp", "both"):
+        disc = console.input("[cyan]Choose 'nmap', 'arp' or 'both': ").strip().lower()
+
+    # choose export type (default excel)
+    export_choice = console.input("[cyan]Export format ([b]excel[/b]/[b]csv[/b]/[b]json) [excel]: ").strip().lower() or "excel"
+    while export_choice not in ("excel", "csv", "json"):
+        export_choice = console.input("[cyan]Choose 'excel', 'csv' or 'json': ").strip().lower()
+
+    local_ip = get_local_ip()
+    if not local_ip:
+        console.print("[red]Could not determine local IP address — aborting.[/red]")
+        return
+    network_cidr = str(ipaddress.ip_network(f"{local_ip}/24", strict=False))
+    console.print(f"[blue]Scanning subnet: {network_cidr}[/blue]")
+
+    # discovery phase
+    discovered = []
+    if disc == "arp":
+        discovered = arp_discover(network_cidr)
+    elif disc == "nmap":
+        discovered = nmap_discover(network_cidr)
+    else:
+        arp_list = arp_discover(network_cidr)
+        nmap_list = nmap_discover(network_cidr)
+        ipmap = {}
+        for d in arp_list:
+            ipmap[d["ip"]] = d
+        for n in nmap_list:
+            if n["ip"] not in ipmap:
+                ipmap[n["ip"]] = n
+            else:
+                # prefer mac if missing
+                if not ipmap[n["ip"]].get("mac") and n.get("mac"):
+                    ipmap[n["ip"]]["mac"] = n.get("mac")
+        discovered = list(ipmap.values())
+
+    if not discovered:
+        console.print("[red]No devices discovered.[/red]")
+        return
+
+    # scanning mode: if 'both', do quick discovery then deep enrichment (we pass mode accordingly)
+    nmap_mode = "deep" if mode in ("deep", "both") else "quick"
+
+    console.print(f"[cyan]Discovered {len(discovered)} devices — enriching (mode={nmap_mode})...[/cyan]")
+
+    devices_enriched = enrich_devices(discovered, nmap_mode)
+
+    # timestamp last seen/update
+    ts = datetime.utcnow().isoformat() + "Z"
+    for d in devices_enriched:
+        d["last_seen_at"] = ts
+
+    # Show table summary
+    headers = ["IP", "Name", "Vendor (conf)", "OS (conf)", "Role (conf)", "Latency", "Packet Loss", "Open Ports", "Vulns"]
+    tbl = Table(title="ZeroTrace Network Summary (preview)", show_lines=False)
+    for h in headers:
+        tbl.add_column(h, overflow="fold")
+    for d in devices_enriched:
+        vendor_conf = f"{d.get('vendor')} ({d.get('vendor_conf',0)}%)"
+        os_conf = f"{d.get('os')} ({d.get('os_conf',0)}%)"
+        role_conf = f"{d.get('role')} ({d.get('role_conf',0)}%)"
+        tbl.add_row(
+            str(d.get("ip") or ""),
+            str(d.get("hostname") or ""),
+            vendor_conf,
+            os_conf,
+            role_conf,
+            str(d.get("latency_ms") or ""),
+            str(d.get("packet_loss") or ""),
+            str(d.get("open_ports") or ""),
+            str(d.get("vulnerabilities") or "")
+        )
+    console.print(tbl)
+
+    # Save report (default Excel in same folder)
+    outname = CONFIG["excel_output"]
+    if export_choice == "excel":
+        save_excel(devices_enriched, outname)
+    elif export_choice == "csv":
+        outcsv = os.path.splitext(outname)[0] + ".csv"
+        save_csv(devices_enriched, outcsv)
+    else:
+        outjson = os.path.splitext(outname)[0] + ".json"
+        save_json(devices_enriched, outjson)
+
+    console.print("[green]Done.[/green]")
+
+if __name__ == "__main__":
+    main()
